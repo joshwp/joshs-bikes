@@ -10,7 +10,8 @@ Plain HTML/CSS/JS, no build step; one small Vercel Function for shared station n
   Green 5+, yellow 1–4, red 0 (the key at the bottom of the page).
 - **Favorites:** start with five, up to ten. "Save as favorite" on a search adds one (or replaces one when full);
   Edit favorites adds, removes, reorders and replaces.
-- **Renaming:** hold any place or station name to open the rename panel (Save, Cancel, Use official name).
+- **Renaming:** tap the ✎ beside a station name (or hold any place or station name) to rename it right in
+  the row (Save, Cancel, Use official name).
   Renamed stations show their official name underneath.
 - **Map:** tap a station name to open it in Google Maps (the Maps app on Android).
 - **Shared names:** station nicknames sync across browsers through `api/nicknames.js`, a Vercel Function

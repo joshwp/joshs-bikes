@@ -852,19 +852,26 @@ function bootApp() {
     if (!state.status.size) right = h('span', { class: 'tile pending', text: '…' });
     else if (stationNote(st)) { off = true; right = h('span', { class: 'tile note', text: stationNote(st) }); }
     else right = tile(st, rowMode(cardMode(state, key), station, me));
-    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, right);
     // The rename field replaces the whole link, so typing in it can never follow the link.
-    onLongPress(row, () => startRename(link, {
+    const rename = (focusNow) => startRename(link, {
       title: 'Rename station',
       value: state.nicknames[station.id] || '',
       placeholder: station.name,
       note: `Official name: ${station.name}`,
       resetLabel: custom ? 'Use official name' : null,
+      focusNow,
       onCommit: (v) => {
         const next = setNickname(state.nicknames, station.id, v, station.name);
         changeNicknames(nicknameChanges(state.nicknames, next, [station.id]));
       },
-    }));
+    });
+    // Pencil beside the name: edit it right here in the row.
+    const pencil = h('button', {
+      type: 'button', class: 'edit-name', icon: 'pencil', 'aria-label': `Rename ${nameText}`,
+      onclick: (e) => { e.preventDefault(); if (!state.renaming && !state.editing) rename(true); },
+    });
+    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, pencil, right);
+    onLongPress(row, () => rename(false));
     return row;
   }
 
@@ -1146,7 +1153,7 @@ function bootApp() {
     const cancel = () => { clearTimeout(timer); timer = null; };
     el.addEventListener('pointerdown', (e) => {
       if (state.editing || state.renaming || (e.pointerType === 'mouse' && e.button !== 0)) return;
-      if (e.target.closest('input, .modes')) return;
+      if (e.target.closest('input, .modes, .edit-name')) return;
       sx = e.clientX; sy = e.clientY;
       cancel();
       timer = setTimeout(() => {
@@ -1168,7 +1175,7 @@ function bootApp() {
    * a title, the field, a note (official name or address) and Save / Cancel buttons, plus
    * an optional "Use official name" reset. Enter or tapping elsewhere saves; Escape cancels.
    */
-  function startRename(target, { title, value, placeholder, note, resetLabel, onCommit }) {
+  function startRename(target, { title, value, placeholder, note, resetLabel, focusNow = false, onCommit }) {
     state.renaming = true;
     const titleId = `rn-${Date.now().toString(36)}`;
     const input = h('input', {
@@ -1208,8 +1215,14 @@ function bootApp() {
       if (e.key === 'Escape') { e.preventDefault(); finish(false); }
     });
     input.addEventListener('blur', () => finish(true));
-    // The finger (or mouse button) is still down. Focus when it lifts: on Android that
-    // release counts as a user gesture, which is what lets the keyboard open.
+    if (focusNow) {
+      // Opened by a tap (the pencil): that tap is the user gesture, so focus now and the keyboard opens.
+      input.focus();
+      input.select();
+      return;
+    }
+    // Opened by a hold: the finger (or mouse button) is still down. Focus when it lifts —
+    // on Android that release counts as a user gesture, which is what lets the keyboard open.
     window.addEventListener('pointerup', () => {
       if (!done) setTimeout(() => { input.focus(); input.select(); }, 0);
     }, { once: true, capture: true });
