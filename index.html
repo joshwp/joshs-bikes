@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light only">
+  <meta name="theme-color" content="#0b5394">
+  <meta name="description" content="Live Citi Bike availability near my favorite places.">
+  <title>Josh's Bikes</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div id="ptr" class="ptr" aria-live="polite">
+    <span class="ptr-icon" aria-hidden="true"></span><span class="ptr-text">Pull to refresh</span>
+  </div>
+
+  <header id="hdr">
+    <div class="hdr-top">
+      <h1>Josh's Bikes</h1>
+      <span id="updated" class="updated">Loading…</span>
+    </div>
+    <div class="hdr-controls">
+      <div class="toggle" role="radiogroup" aria-label="Show bikes or docks">
+        <button type="button" role="radio" data-mode="auto" aria-checked="true">Auto</button>
+        <button type="button" role="radio" data-mode="bikes" aria-checked="false">Bikes</button>
+        <button type="button" role="radio" data-mode="docks" aria-checked="false">Docks</button>
+      </div>
+      <button type="button" id="locBtn" class="loc-btn" aria-expanded="false" aria-controls="locPanel">
+        <svg class="pin" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>
+        <span id="locLabel" class="loc-label">GPS…</span>
+        <span class="caret" aria-hidden="true">▾</span>
+      </button>
+    </div>
+    <div id="locPanel" class="loc-panel" hidden>
+      <p class="panel-title">Set my location</p>
+      <div id="locChoices" class="chips"></div>
+      <form id="locForm" class="inline-form" autocomplete="off">
+        <input id="locInput" type="text" inputmode="text" placeholder="Type an address" aria-label="Address for my location" enterkeyhint="go">
+        <button type="submit">Set</button>
+      </form>
+      <p id="locMsg" class="msg" role="status"></p>
+    </div>
+  </header>
+
+  <main>
+    <section id="favs" aria-label="Favorites">
+      <div class="sec-head">
+        <h2>Favorites</h2>
+        <button type="button" id="editBtn" class="link-btn">Edit</button>
+      </div>
+      <div id="favList"></div>
+    </section>
+
+    <section id="lookup" aria-label="Address lookup">
+      <div class="sec-head"><h2>Look up an address</h2></div>
+      <form id="lookupForm" class="inline-form" autocomplete="off">
+        <input id="lookupInput" type="search" placeholder="Street address" aria-label="Street address to look up" enterkeyhint="search">
+        <button type="submit">Look up</button>
+      </form>
+      <p id="lookupMsg" class="msg" role="status"></p>
+      <details id="recents">
+        <summary>Recent addresses</summary>
+        <ul id="recentList" class="recent-list"></ul>
+      </details>
+      <div id="lookupResults"></div>
+    </section>
+  </main>
+
+  <noscript><p class="msg">Josh's Bikes needs JavaScript.</p></noscript>
+</body>
+</html>
