@@ -235,6 +235,7 @@ function parsePhoton(json) {
     // Named businesses come back as type "house" (they sit at an address); streets and areas don't count.
     if (['highway', 'boundary', 'landuse', 'railway'].includes(p.osm_key) || p.type === 'street') continue;
     if (p.osm_key === 'place' && ['city', 'state', 'country', 'county'].includes(p.osm_value)) continue;
+    if (p.state && p.state !== 'New York') continue; // the search box covers NYC; the bbox also catches NJ
     const street = [p.housenumber, p.street].filter(Boolean).join(' ');
     const area = p.district || p.locality || (p.city !== 'New York' ? p.city : '') || '';
     const sub = [street && prettyStreet(street), area].filter(Boolean).join(', ');
@@ -277,7 +278,8 @@ async function searchAddresses(q, signal) {
 }
 
 async function searchPlaces(q, near, signal) {
-  const params = new URLSearchParams({ q, limit: '8', lang: 'en', bbox: NYC_BBOX });
+  // Ask for plenty: Photon ranks by relevance, so the nearest branch of a chain can sit well down the list.
+  const params = new URLSearchParams({ q, limit: '40', lang: 'en', bbox: NYC_BBOX });
   if (near) { params.set('lat', near.lat.toFixed(4)); params.set('lon', near.lon.toFixed(4)); }
   return sortBranches(parsePhoton(await fetchJSON(`${PHOTON_URL}?${params}`, signal)), near).slice(0, 5);
 }
@@ -655,8 +657,7 @@ function bootApp() {
     if (showFail) {
       if (!state.lastLoad) els.failLine.textContent = "Couldn't load stations. Pull down to try again.";
       else {
-        const m = minutesAgo(state.lastLoad, now);
-        els.failLine.textContent = `Couldn't refresh · showing data from ${m < 1 ? 'just now' : `${m} min ago`}`;
+        els.failLine.textContent = "Couldn't refresh · showing the last data. Pull down to try again.";
       }
     }
 
@@ -700,7 +701,11 @@ function bootApp() {
 
   function miniTile(st, mode) {
     if (!st || stationNote(st)) return h('span', { class: 'mini off', 'aria-hidden': 'true', text: '–' });
-    if (mode === 'bikes') return h('span', { class: `mini bikes ${colorClass(st.ebikes)}`, text: String(st.ebikes) });
+    if (mode === 'bikes') {
+      return h('span', { class: 'mini bikes split' },
+        h('span', { class: `mseg ${colorClass(st.ebikes)}`, text: String(st.ebikes) }),
+        h('span', { class: `mseg sm ${colorClass(st.classic)}`, text: String(st.classic) }));
+    }
     return h('span', { class: `mini docks ${colorClass(st.docks)}`, text: String(st.docks) });
   }
 
@@ -760,7 +765,7 @@ function bootApp() {
         stations.map((s) => miniTile(state.status.get(s.id), rowMode(mode, s, me)))));
     }
     onLongPress(toggle, () => startRename(toggle, {
-      value: f.label, placeholder: 'Name', hint: 'Rename this place · Enter to save',
+      value: f.label, placeholder: f.label, hint: `${f.address} · Enter to save`,
       onCommit: (v) => {
         if (!v) return;
         f.label = v;
@@ -870,6 +875,7 @@ function bootApp() {
     };
     const close = () => {
       clearTimeout(timer);
+      seq += 1; // any in-flight search is now stale and must not reopen the box
       if (ctrl) ctrl.abort();
       box.hidden = true;
       box.replaceChildren();
@@ -899,9 +905,10 @@ function bootApp() {
       const mine = ++seq;
       open([h('p', { class: 'sug-note', text: 'Searching…' })]);
       const near = myLocation(state);
+      const wantAddrs = /\d/.test(q);
       const [places, addrs] = await Promise.allSettled([
         searchPlaces(q, near, ctrl.signal),
-        /\d/.test(q) ? searchAddresses(q, ctrl.signal) : Promise.resolve([]),
+        wantAddrs ? searchAddresses(q, ctrl.signal) : Promise.resolve([]),
       ]);
       if (mine !== seq) return; // a newer query is in flight
       const P = places.status === 'fulfilled' ? places.value : [];
@@ -911,8 +918,12 @@ function bootApp() {
       if (P.length) secs.push(section('Places', P));
       if (A.length && !/^\d/.test(q)) secs.push(section('Addresses', A));
       if (!secs.length) {
-        const failed = places.status === 'rejected' && addrs.status !== 'fulfilled';
-        secs.push(h('p', { class: 'sug-note', text: failed ? "Search isn't reachable right now." : 'No matches. Try a street address or a place name.' }));
+        const placesDown = places.status === 'rejected';
+        const addrsDown = wantAddrs && addrs.status === 'rejected';
+        const msg = placesDown && (addrsDown || !wantAddrs)
+          ? (wantAddrs ? "Search isn't reachable right now." : "Place search isn't reachable right now. Try a street address.")
+          : 'No matches. Try a street address or a place name.';
+        secs.push(h('p', { class: 'sug-note', text: msg }));
       }
       open(secs);
     };
@@ -966,13 +977,15 @@ function bootApp() {
     const L = state.lookup;
     const i = state.favorites.findIndex((f) => f.id === slotId);
     if (!L || i < 0) return;
-    state.favorites[i] = { id: slotId, label: L.name, address: [L.name, L.sub].filter(Boolean).join(', '), lat: L.lat, lon: L.lon };
+    const id = newId();
+    state.favorites[i] = { id, label: L.name, address: [L.name, L.sub].filter(Boolean).join(', '), lat: L.lat, lon: L.lon };
     saveJSON(STORAGE_KEYS.favorites, state.favorites);
+    if (state.override && state.override.kind === 'favorite' && state.override.id === slotId) state.override = null;
     state.lookup = null;
     state.picking = false;
-    state.expanded.add(slotId);
+    state.expanded.add(id);
     render();
-    const el = els.cards.querySelector(`[data-id="${slotId}"]`);
+    const el = els.cards.querySelector(`[data-id="${id}"]`);
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
@@ -1079,15 +1092,18 @@ function bootApp() {
       },
     });
 
-    const namesBox = h('div', { class: 'edit-stations' });
+    const namesList = h('div', { class: 'edit-stations' });
+    const namesBox = h('details', { class: 'edit-names' }, h('summary', { text: 'Station names' }), namesList);
     const renderStationNames = () => {
       const stations = Number.isFinite(f.lat) && state.stations.length ? closestStations(f.lat, f.lon, state.stations) : [];
-      namesBox.replaceChildren(...(stations.length ? [h('p', { class: 'edit-sub', text: 'Station names' })] : []),
-        ...stations.map((s) => h('input', {
+      namesBox.hidden = !stations.length;
+      namesList.replaceChildren(...stations.map((s) => h('label', { class: 'st-field' },
+        h('span', { class: 'st-official', text: s.name }),
+        h('input', {
           type: 'text', class: 'st-name', maxlength: '48', 'aria-label': `Name for ${s.name}`,
-          placeholder: s.name, value: f.names[s.id] != null ? f.names[s.id] : (state.nicknames[s.id] || ''),
+          placeholder: 'Same as official', value: f.names[s.id] != null ? f.names[s.id] : (state.nicknames[s.id] || ''),
           oninput: (e) => { f.names[s.id] = e.target.value; },
-        })));
+        }))));
     };
     renderStationNames();
 
@@ -1099,6 +1115,7 @@ function bootApp() {
             type: 'button', class: 'btn secondary small',
             onclick: () => {
               f.label = ''; f.address = ''; f.lat = NaN; f.lon = NaN; f.error = ''; f.names = {};
+              f.newId = newId(); // a replaced favorite is a new place
               label.value = ''; addr.value = ''; err.textContent = '';
               label.placeholder = 'New name'; addr.placeholder = 'New address or place';
               renderStationNames();
@@ -1116,12 +1133,16 @@ function bootApp() {
     handle.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       handle.setPointerCapture(e.pointerId);
-      const startY = e.clientY;
+      const startY = e.clientY + window.scrollY; // page coordinates, so auto-scroll doesn't break the math
       let shift = 0; // how far the card's layout position moved due to DOM swaps
+      let lastY = e.clientY;
+      let scroller = null;
       card.classList.add('dragging');
 
       const onMove = (ev) => {
-        card.style.transform = `translateY(${ev.clientY - startY - shift}px)`;
+        lastY = ev.clientY;
+        const y = ev.clientY + window.scrollY;
+        card.style.transform = `translateY(${y - startY - shift}px)`;
         const r = card.getBoundingClientRect();
         const mid = r.top + r.height / 2;
         const next = card.nextElementSibling;
@@ -1132,7 +1153,7 @@ function bootApp() {
             const before = card.offsetTop;
             list.insertBefore(next, card);
             shift += card.offsetTop - before;
-            card.style.transform = `translateY(${ev.clientY - startY - shift}px)`;
+            card.style.transform = `translateY(${y - startY - shift}px)`;
             return;
           }
         }
@@ -1142,11 +1163,21 @@ function bootApp() {
             const before = card.offsetTop;
             list.insertBefore(card, prev);
             shift += card.offsetTop - before;
-            card.style.transform = `translateY(${ev.clientY - startY - shift}px)`;
+            card.style.transform = `translateY(${y - startY - shift}px)`;
           }
         }
       };
+      // Scroll the page while the finger holds near the top or bottom edge.
+      const edgeScroll = () => {
+        const edge = 90;
+        const vh = window.innerHeight;
+        const v = lastY < edge ? -(edge - lastY) / 5 : lastY > vh - edge ? (lastY - (vh - edge)) / 5 : 0;
+        if (v) { window.scrollBy(0, v); onMove({ clientY: lastY }); }
+        scroller = requestAnimationFrame(edgeScroll);
+      };
+      scroller = requestAnimationFrame(edgeScroll);
       const onEnd = () => {
+        cancelAnimationFrame(scroller);
         handle.removeEventListener('pointermove', onMove);
         handle.removeEventListener('pointerup', onEnd);
         handle.removeEventListener('pointercancel', onEnd);
@@ -1208,7 +1239,7 @@ function bootApp() {
     }
     state.nicknames = nick;
     saveJSON(STORAGE_KEYS.nicknames, nick);
-    state.favorites = draft.map(({ id, label, address, lat, lon }) => ({ id, label, address, lat, lon }));
+    state.favorites = draft.map(({ id, newId: nid, label, address, lat, lon }) => ({ id: nid || id, label, address, lat, lon }));
     saveJSON(STORAGE_KEYS.favorites, state.favorites);
     // Keep a favorite-based location override pointing at the edited favorite.
     if (state.override && state.override.kind === 'favorite') {
