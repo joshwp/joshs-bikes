@@ -249,4 +249,10 @@ test('formatUpdated', () => {
   assert.equal(A.formatUpdated(t, t + 7 * 60_000 + 5), 'Updated 7 min ago');
 });
 
+test('mapsUrl: Google Maps search link to the exact point', () => {
+  assert.equal(A.mapsUrl(40.669765, -73.981835),
+    'https://www.google.com/maps/search/?api=1&query=40.669765,-73.981835');
+  assert.equal(A.mapsUrl(40.7, -74), 'https://www.google.com/maps/search/?api=1&query=40.700000,-74.000000');
+});
+
 console.log(`\n${passed} checks passed`);

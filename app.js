@@ -346,6 +346,11 @@ function stationNote(st) {
   return null;
 }
 
+/** Google Maps link to a point. On Android this opens the Maps app when it's installed. */
+function mapsUrl(lat, lon) {
+  return `https://www.google.com/maps/search/?api=1&query=${Number(lat).toFixed(6)},${Number(lon).toFixed(6)}`;
+}
+
 function formatMiles(d) {
   if (!Number.isFinite(d)) return '';
   if (d < 0.1) return '<0.1 mi';
@@ -712,14 +717,23 @@ function bootApp() {
   function stationRow(station, key, me) {
     const st = state.status.get(station.id);
     const nameText = displayName(station, state.nicknames);
-    const name = h('span', { class: 'name', text: nameText });
+    // Tap the name: open the station in Google Maps. Hold it: rename (handled on the row below).
+    const link = h('a', {
+      class: 'name-link', href: mapsUrl(station.lat, station.lon), target: '_blank', rel: 'noopener',
+      draggable: 'false', 'aria-label': `${nameText}, open in Google Maps`,
+      onclick: (e) => {
+        // A long press that just opened the rename field must not also open the map.
+        if (row.dataset.lp) { e.preventDefault(); delete row.dataset.lp; }
+      },
+    }, h('span', { class: 'name', text: nameText }));
     let right;
     let off = false;
     if (!state.status.size) right = h('span', { class: 'tile pending', text: '…' });
     else if (stationNote(st)) { off = true; right = h('span', { class: 'tile note', text: stationNote(st) }); }
     else right = tile(st, rowMode(cardMode(state, key), station, me));
-    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, name, right);
-    onLongPress(row, () => startRename(name, {
+    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, right);
+    // The rename field replaces the whole link, so typing in it can never follow the link.
+    onLongPress(row, () => startRename(link, {
       value: state.nicknames[station.id] || '',
       placeholder: station.name,
       hint: `Official name: ${station.name} · clear to reset`,
@@ -1359,7 +1373,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_RECENTS, STORAGE_KEYS, HOME_ID,
-    haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts, formatMiles,
+    haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts, formatMiles, mapsUrl,
     parseStationInfo, parseStationStatus, parseVehicleTypes, feedsFromDiscovery,
     parsePhoton, parseGeoSearch, prettyStreet, categoryLabel, sortBranches,
     addRecent, setNickname, displayName, initialExpanded, cardMode,

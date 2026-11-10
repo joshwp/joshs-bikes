@@ -262,8 +262,24 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
   user-select: none;
   -webkit-touch-callout: none;
 }
-.name {
+/* The station name is a Google Maps link that fills the row's height (a big tap target). */
+.name-link {
   flex: 1;
+  min-width: 0;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  margin: -6px 0;
+  padding: 6px 0;
+  border-radius: 8px;
+  color: inherit;
+  text-decoration: none;
+  -webkit-touch-callout: none;
+  -webkit-user-drag: none;
+}
+.name-link:active .name { color: var(--accent); }
+@media (hover: hover) { .name-link:hover .name { text-decoration: underline; text-underline-offset: 2px; } }
+.name {
   min-width: 0;
   font-size: 15px;
   line-height: 1.25;

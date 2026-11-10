@@ -9,6 +9,7 @@ Plain HTML/CSS/JS, no build step, no backend.
 - **Reading a tile:** solid = bikes to take (⚡ e-bikes large, classic small); dashed = docks to fill.
   Green 5+, yellow 1–4, red 0.
 - **Renaming:** hold any place or station name to rename it; Edit favorites for address, order and replace.
+- **Map:** tap a station name to open it in Google Maps (the Maps app on Android).
 
 Dev:
 - `node tests/logic.test.js` — logic checks
