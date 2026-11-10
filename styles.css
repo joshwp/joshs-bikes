@@ -8,9 +8,9 @@
   --line: #e5e7eb;
   --band: #f3f4f6;
   --accent: #0b5394;
-  /* Availability colors, all >= 4.5:1 contrast on white */
+  /* Availability colors on white */
   --good: #15803d; /* green  5.0:1 */
-  --low: #a16207;  /* yellow 4.9:1 */
+  --low: #ad8500;  /* yellow 3.4:1 (all numbers are bold >= 19px = WCAG large text) */
   --none: #b91c1c; /* red    6.5:1 */
 }
 
@@ -196,7 +196,7 @@ h2 { font-size: 13px; margin: 0; color: var(--muted); text-transform: uppercase;
   margin-right: 2px;
 }
 .big { font-size: 30px; font-weight: 800; line-height: 1; }
-.small { font-size: 18px; font-weight: 700; }
+.small { font-size: 19px; font-weight: 700; }
 .c-good { color: var(--good); }
 .c-low { color: var(--low); }
 .c-none { color: var(--none); }

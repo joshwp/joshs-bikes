@@ -30,10 +30,13 @@ const DEFAULT_FAVORITES = [
   { label: 'HSS',    address: '540 E 71st St, New York, NY 10021',  lat: 40.765055, lon: -73.952546 },
 ];
 
+const HOME_ID = 'home';
+
 const STORAGE_KEYS = {
   favorites: 'jb.favorites.v1',
   recents: 'jb.recents.v1',
   stationInfo: 'jb.stationInfo.v1',
+  lastStatus: 'jb.lastStatus.v1', // last good station_status, shown if a fetch fails
   feeds: 'jb.feeds.v1',
 };
 
@@ -67,15 +70,21 @@ async function fetchJSON(url) {
   return res.json();
 }
 
+/** Feed list from a discovery file: GBFS 1.x/2.x (data.en.feeds) or 3.x (data.feeds). */
+function feedsFromDiscovery(d) {
+  const data = (d && d.data) || {};
+  const list = Array.isArray(data.feeds) ? data.feeds : (data.en && data.en.feeds) || [];
+  const out = {};
+  for (const f of list) {
+    if (['station_information', 'station_status', 'vehicle_types'].includes(f.name)) out[f.name] = f.url;
+  }
+  return out;
+}
+
 /** Follow the auto-discovery file to the English feeds; fall back to the last known URLs. */
 async function discoverFeeds() {
   try {
-    const d = await fetchJSON(DISCOVERY_URL);
-    const feeds = (d && d.data && d.data.en && d.data.en.feeds) || [];
-    const out = {};
-    for (const f of feeds) {
-      if (f.name === 'station_information' || f.name === 'station_status') out[f.name] = f.url;
-    }
+    const out = feedsFromDiscovery(await fetchJSON(DISCOVERY_URL));
     if (out.station_information && out.station_status) {
       saveJSON(STORAGE_KEYS.feeds, out);
       return out;
@@ -97,28 +106,61 @@ function parseStationInfo(json) {
   return out;
 }
 
+/** vehicle_types feed -> Map(vehicle_type_id -> {form, propulsion}) */
+function parseVehicleTypes(json) {
+  const list = (json && json.data && json.data.vehicle_types) || [];
+  return new Map(list.map((t) => [String(t.vehicle_type_id), {
+    form: String(t.form_factor || ''), propulsion: String(t.propulsion_type || ''),
+  }]));
+}
+
+function isBicycleType(id, types) {
+  const t = types && types.get(String(id));
+  if (t) return !t.form || t.form === 'bicycle';
+  return !/scooter|moped|car/i.test(String(id));
+}
+
+function isElectricType(id, types) {
+  const t = types && types.get(String(id));
+  if (t) return t.propulsion.startsWith('electric');
+  return /e-?bike|electric|pedelec/i.test(String(id)); // no type info: best guess from the id
+}
+
 /**
- * Counts for one station_status record. In the live Citi Bike feed
- * num_bikes_available INCLUDES e-bikes, so classic = bikes − ebikes.
+ * Counts for one station_status record. In the live Citi Bike feed (GBFS 1.1,
+ * confirmed 2026-11-10) num_bikes_available INCLUDES e-bikes, so
+ * classic = bikes − ebikes. If a future feed drops num_ebikes_available in favor
+ * of vehicle_types_available, the counts are derived from that instead.
  */
-function deriveCounts(s) {
+function deriveCounts(s, vehicleTypes) {
+  const docks = Math.max(0, Number(s.num_docks_available) || 0);
+  if (s.num_ebikes_available == null && Array.isArray(s.vehicle_types_available)) {
+    let ebikes = 0, classic = 0;
+    for (const v of s.vehicle_types_available) {
+      const n = Math.max(0, Number(v.count) || 0);
+      if (!isBicycleType(v.vehicle_type_id, vehicleTypes)) continue;
+      if (isElectricType(v.vehicle_type_id, vehicleTypes)) ebikes += n; else classic += n;
+    }
+    return { ebikes, classic, docks };
+  }
   const bikes = Math.max(0, Number(s.num_bikes_available) || 0);
   const ebikes = Math.min(bikes, Math.max(0, Number(s.num_ebikes_available) || 0));
-  return {
-    ebikes,
-    classic: bikes - ebikes,
-    docks: Math.max(0, Number(s.num_docks_available) || 0),
-  };
+  return { ebikes, classic: bikes - ebikes, docks };
+}
+
+function statusUsesVehicleTypes(json) {
+  const list = (json && json.data && json.data.stations) || [];
+  return list.some((s) => s.num_ebikes_available == null && Array.isArray(s.vehicle_types_available));
 }
 
 /** station_status -> Map(id -> {ebikes, classic, docks, installed, renting, returning}) */
-function parseStationStatus(json) {
+function parseStationStatus(json, vehicleTypes) {
   const list = (json && json.data && json.data.stations) || [];
   const map = new Map();
   for (const s of list) {
     if (!s.station_id) continue;
     map.set(String(s.station_id), {
-      ...deriveCounts(s),
+      ...deriveCounts(s, vehicleTypes),
       installed: !!s.is_installed,
       renting: !!s.is_renting,
       returning: !!s.is_returning,
@@ -201,9 +243,12 @@ function isPlace(p) {
 
 function loadFavorites() {
   const saved = loadJSON(STORAGE_KEYS.favorites, null);
-  const list = Array.isArray(saved) && saved.every(isPlace) && saved.length <= MAX_FAVORITES
+  const list = Array.isArray(saved) && saved.length >= 1 && saved.length <= MAX_FAVORITES && saved.every(isPlace)
     ? saved : DEFAULT_FAVORITES;
-  return list.map((f) => ({ id: f.id || newId(), label: f.label, address: f.address, lat: f.lat, lon: f.lon }));
+  return list.map((f, i) => ({
+    id: f.id || (list === DEFAULT_FAVORITES && i === 0 ? HOME_ID : newId()),
+    label: f.label, address: f.address, lat: f.lat, lon: f.lon,
+  }));
 }
 
 function loadRecents() {
@@ -223,8 +268,14 @@ function addRecent(recents, entry) {
   return [{ address: entry.address, lat: entry.lat, lon: entry.lon }, ...rest].slice(0, MAX_RECENTS);
 }
 
+/** The Home favorite (tracked by id, so renaming or moving it keeps it Home). */
+function homeFavorite(favorites) {
+  return favorites.find((f) => f.id === HOME_ID) ||
+    favorites.find((f) => f.label.trim().toLowerCase() === 'home') || null;
+}
+
 function homeCoords(favorites) {
-  const home = favorites.find((f) => f.label.trim().toLowerCase() === 'home');
+  const home = homeFavorite(favorites);
   return home ? { lat: home.lat, lon: home.lon } : { lat: DEFAULT_FAVORITES[0].lat, lon: DEFAULT_FAVORITES[0].lon };
 }
 
@@ -255,7 +306,8 @@ function myLocation(st) {
   if (st.override) return { lat: st.override.lat, lon: st.override.lon, source: st.override.label };
   if (st.gps.status === 'ok') return { lat: st.gps.lat, lon: st.gps.lon, source: 'GPS' };
   const home = homeCoords(st.favorites);
-  return { ...home, source: st.gps.status === 'pending' ? 'GPS…' : 'Home (no GPS)' };
+  const hf = homeFavorite(st.favorites);
+  return { ...home, source: st.gps.status === 'pending' ? 'GPS…' : `${hf ? hf.label : 'Home'} (no GPS)` };
 }
 
 function formatUpdated(lastLoad, now) {
@@ -330,6 +382,29 @@ function bootApp() {
     });
   }
 
+  /** Last good status, so an offline open still shows numbers (with "Couldn't refresh"). */
+  function restoreStatusCache() {
+    const cached = loadJSON(STORAGE_KEYS.lastStatus, null);
+    if (!cached || !Array.isArray(cached.rows) || !Number.isFinite(cached.savedAt)) return;
+    const map = new Map();
+    for (const r of cached.rows) {
+      if (!Array.isArray(r) || r.length !== 5) continue;
+      const [id, ebikes, classic, docks, flags] = r;
+      map.set(id, { ebikes, classic, docks, installed: !!(flags & 1), renting: !!(flags & 2), returning: !!(flags & 4) });
+    }
+    if (map.size) { state.status = map; state.lastLoad = cached.savedAt; }
+  }
+
+  function storeStatusCache(map, savedAt) {
+    const rows = [];
+    for (const [id, s] of map) {
+      rows.push([id, s.ebikes, s.classic, s.docks, (s.installed ? 1 : 0) | (s.renting ? 2 : 0) | (s.returning ? 4 : 0)]);
+    }
+    saveJSON(STORAGE_KEYS.lastStatus, { savedAt, rows });
+  }
+
+  let vehicleTypes = null; // only fetched if the feed ever switches to vehicle_types_available
+
   /** On open: station_information + station_status. On pull-down: status only. */
   async function refresh({ withInfo = false } = {}) {
     if (state.loading) return;
@@ -352,9 +427,13 @@ function bootApp() {
       }
       if (statusRes.status !== 'fulfilled') throw statusRes.reason;
       if (!state.stations.length) throw new Error('no station information');
-      state.status = parseStationStatus(statusRes.value);
+      if (!vehicleTypes && feeds.vehicle_types && statusUsesVehicleTypes(statusRes.value)) {
+        try { vehicleTypes = parseVehicleTypes(await fetchJSON(feeds.vehicle_types)); } catch (e) { /* id heuristic */ }
+      }
+      state.status = parseStationStatus(statusRes.value, vehicleTypes);
       state.lastLoad = Date.now();
       state.refreshFailed = false;
+      storeStatusCache(state.status, state.lastLoad);
     } catch (e) {
       console.warn('Refresh failed:', e);
       state.refreshFailed = true;
@@ -580,19 +659,8 @@ function bootApp() {
     const list = h('div', { class: 'edit-list' });
     for (const f of state.draft) list.append(editCard(f, list));
     wrap.append(list);
+    // Always exactly the favorites I have (max 5): no add/remove, only edit, reorder, replace.
     const foot = h('div', { class: 'editor-foot' });
-    if (state.draft.length < MAX_FAVORITES) {
-      foot.append(h('button', {
-        type: 'button', class: 'btn secondary',
-        onclick: () => {
-          syncDraftOrder(list);
-          state.draft.push({ id: newId(), label: '', address: '', lat: NaN, lon: NaN, origAddress: '', error: '' });
-          renderEditor();
-          const inputs = els.favList.querySelectorAll('.edit-card:last-child input');
-          if (inputs[0]) inputs[0].focus();
-        },
-      }, '+ Add favorite'));
-    }
     foot.append(h('div', { class: 'right' },
       h('button', { type: 'button', class: 'btn secondary', onclick: cancelEdit, disabled: state.saving }, 'Cancel'),
       h('button', { type: 'button', class: 'btn', onclick: () => saveEdits(list), disabled: state.saving },
@@ -623,15 +691,7 @@ function bootApp() {
             label.placeholder = 'New label'; addr.placeholder = 'New address';
             label.focus();
           },
-        }, 'Replace'),
-        h('button', {
-          type: 'button', class: 'btn danger',
-          onclick: () => {
-            syncDraftOrder(list);
-            state.draft = state.draft.filter((d) => d !== f);
-            renderEditor();
-          },
-        }, 'Remove')));
+        }, 'Replace')));
     makeDraggable(card, list);
     return card;
   }
@@ -809,6 +869,7 @@ function bootApp() {
 
   /* ---------------- Boot ---------------- */
   restoreStationCache();
+  restoreStatusCache();
   render();
   requestGps();
   refresh({ withInfo: true });
@@ -845,7 +906,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_RECENTS, STORAGE_KEYS,
     haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts,
-    parseStationInfo, parseStationStatus, addRecent, createState, myLocation, formatUpdated,
-    loadFavorites, loadRecents, homeCoords,
+    parseStationInfo, parseStationStatus, parseVehicleTypes, feedsFromDiscovery,
+    addRecent, createState, myLocation, formatUpdated, loadFavorites, loadRecents, homeCoords,
   };
 }
