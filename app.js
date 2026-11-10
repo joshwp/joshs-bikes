@@ -1,6 +1,10 @@
 /* Josh's Bikes — live Citi Bike availability for my favorite places.
  * Plain browser JavaScript, no build step. Pure logic is exported for
  * Node-based checks at the bottom of the file; the UI only boots in a browser.
+ *
+ * Sections: Config · Storage · Data fetching · Geocoding and search ·
+ * Distance and ranking · State · Browser app (rendering, search UI, rename,
+ * edit mode, pull-to-refresh, boot) · Exports
  */
 'use strict';
 
@@ -13,13 +17,16 @@ const DEFAULT_FEEDS = {
   station_information: 'https://gbfs.lyft.com/gbfs/1.1/bkn/en/station_information.json',
   station_status: 'https://gbfs.lyft.com/gbfs/1.1/bkn/en/station_status.json',
 };
-const GEOSEARCH_URL = 'https://geosearch.planninglabs.nyc/v2/search';
+const GEOSEARCH_URL = 'https://geosearch.planninglabs.nyc/v2';   // NYC addresses (no key)
+const PHOTON_URL = 'https://photon.komoot.io/api/';               // OpenStreetMap places (no key)
+const NYC_BBOX = '-74.27,40.48,-73.68,40.93';                     // minLon,minLat,maxLon,maxLat
 
 const AUTO_RADIUS_MI = 0.5;
 const STATIONS_PER_PLACE = 5;
 const MAX_FAVORITES = 5;
 const MAX_RECENTS = 3;
 const EARTH_RADIUS_MI = 3958.7613;
+const WIDE_QUERY = '(min-width: 760px)'; // desktop/tablet: grid layout, everything expanded
 
 // Geocoded at build time with NYC Planning Labs GeoSearch (top result).
 const DEFAULT_FAVORITES = [
@@ -35,6 +42,7 @@ const HOME_ID = 'home';
 const STORAGE_KEYS = {
   favorites: 'jb.favorites.v1',
   recents: 'jb.recents.v1',
+  nicknames: 'jb.nicknames.v1',   // { station_id: "My name" }
   stationInfo: 'jb.stationInfo.v1',
   lastStatus: 'jb.lastStatus.v1', // last good station_status, shown if a fetch fails
   feeds: 'jb.feeds.v1',
@@ -64,8 +72,8 @@ function saveJSON(key, value) {
 /* =====================================================================
  * Data fetching (GBFS)
  * ===================================================================== */
-async function fetchJSON(url) {
-  const res = await fetch(url, { cache: 'no-store' });
+async function fetchJSON(url, signal) {
+  const res = await fetch(url, { cache: 'no-store', signal });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return res.json();
 }
@@ -170,20 +178,127 @@ function parseStationStatus(json, vehicleTypes) {
 }
 
 /* =====================================================================
- * Geocoding (NYC Planning Labs GeoSearch, no key)
+ * Geocoding and search
+ *   Addresses: NYC Planning Labs GeoSearch. Places/businesses: Photon (OSM).
  * ===================================================================== */
+const STREET_ABBR = [
+  [/\bStreet\b/g, 'St'], [/\bAvenue\b/g, 'Ave'], [/\bBoulevard\b/g, 'Blvd'], [/\bPlace\b/g, 'Pl'],
+  [/\bRoad\b/g, 'Rd'], [/\bParkway\b/g, 'Pkwy'], [/\bDrive\b/g, 'Dr'], [/\bTerrace\b/g, 'Ter'],
+  [/\bEast (?=\d)/g, 'E '], [/\bWest (?=\d)/g, 'W '], [/\bNorth (?=\d)/g, 'N '], [/\bSouth (?=\d)/g, 'S '],
+];
+
+function ordinal(n) {
+  const v = n % 100;
+  if (v >= 11 && v <= 13) return `${n}th`;
+  return n + ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+}
+
+function titleCase(s) {
+  return String(s).toLowerCase().replace(/(^|[\s\-/])([a-z])/g, (m, a, b) => a + b.toUpperCase());
+}
+
+/** "540 EAST 71 STREET" -> "540 E 71st St"; "6th Street" -> "6th St". */
+function prettyStreet(s) {
+  let out = /[a-z]/.test(s) ? String(s) : titleCase(s);
+  for (const [re, to] of STREET_ABBR) out = out.replace(re, to);
+  // Bare street numbers get ordinals: "413 6 St" -> "413 6th St" (house number untouched).
+  out = out.replace(/(\s)(\d+)(?= (St|Ave|Pl|Rd|Dr|Ter|Blvd)\b)/g, (m, sp, n) => sp + ordinal(Number(n)));
+  return out.trim();
+}
+
+const CATEGORY_NAMES = {
+  restaurant: 'Restaurant', fast_food: 'Fast food', cafe: 'Café', bar: 'Bar', pub: 'Pub',
+  biergarten: 'Beer garden', ice_cream: 'Ice cream', bakery: 'Bakery', fitness_centre: 'Gym',
+  sports_centre: 'Sports center', hospital: 'Hospital', clinic: 'Clinic', doctors: 'Doctor',
+  dentist: 'Dentist', pharmacy: 'Pharmacy', supermarket: 'Supermarket', convenience: 'Shop',
+  park: 'Park', museum: 'Museum', theatre: 'Theater', cinema: 'Cinema', school: 'School',
+  university: 'University', college: 'College', hotel: 'Hotel', library: 'Library',
+  place_of_worship: 'Place of worship', station: 'Station', attraction: 'Attraction',
+  marketplace: 'Market', stadium: 'Stadium', arts_centre: 'Arts center', nightclub: 'Club',
+};
+
+function categoryLabel(key, value) {
+  if (key === 'place') return 'Neighborhood';
+  if (CATEGORY_NAMES[value]) return CATEGORY_NAMES[value];
+  const v = String(value || key || 'Place').replace(/_/g, ' ');
+  return v.charAt(0).toUpperCase() + v.slice(1);
+}
+
+/** Photon GeoJSON -> [{kind:'place', name, sub, category, lat, lon}] */
+function parsePhoton(json) {
+  const out = [];
+  const seen = new Set();
+  for (const f of (json && json.features) || []) {
+    const p = f.properties || {};
+    const c = f.geometry && f.geometry.coordinates;
+    if (!p.name || !Array.isArray(c)) continue;
+    // Named businesses come back as type "house" (they sit at an address); streets and areas don't count.
+    if (['highway', 'boundary', 'landuse', 'railway'].includes(p.osm_key) || p.type === 'street') continue;
+    if (p.osm_key === 'place' && ['city', 'state', 'country', 'county'].includes(p.osm_value)) continue;
+    const street = [p.housenumber, p.street].filter(Boolean).join(' ');
+    const area = p.district || p.locality || (p.city !== 'New York' ? p.city : '') || '';
+    const sub = [street && prettyStreet(street), area].filter(Boolean).join(', ');
+    const key = `${p.name}|${sub}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ kind: 'place', name: p.name, sub, category: categoryLabel(p.osm_key, p.osm_value), lat: c[1], lon: c[0] });
+  }
+  return out;
+}
+
+/** GeoSearch autocomplete/search GeoJSON -> [{kind:'address', name, sub, lat, lon}] (addresses only) */
+function parseGeoSearch(json) {
+  const out = [];
+  for (const f of (json && json.features) || []) {
+    const p = f.properties || {};
+    const c = f.geometry && f.geometry.coordinates;
+    if (!Array.isArray(c)) continue;
+    const parts = String(p.label || p.name || '').split(',').map((x) => x.trim()).filter(Boolean);
+    // GeoSearch tags plain addresses as "venue" too; an address starts with a house number.
+    // Named places are left to Photon, which has better business coverage.
+    if (!parts.length || !/^\d/.test(parts[0])) continue;
+    out.push({ kind: 'address', name: prettyStreet(parts[0]), sub: parts[1] || '', lat: c[1], lon: c[0] });
+  }
+  return out;
+}
+
+/** Keep the search's relevance order between different places, but list branches of the same name nearest first. */
+function sortBranches(places, near) {
+  if (!near) return places;
+  const firstSeen = new Map();
+  places.forEach((p, i) => { const k = norm(p.name); if (!firstSeen.has(k)) firstSeen.set(k, i); });
+  const d = (p) => haversineMi(near.lat, near.lon, p.lat, p.lon);
+  return [...places].sort((a, b) => (firstSeen.get(norm(a.name)) - firstSeen.get(norm(b.name))) || (d(a) - d(b)));
+}
+
+async function searchAddresses(q, signal) {
+  const url = `${GEOSEARCH_URL}/autocomplete?text=${encodeURIComponent(q)}`;
+  return parseGeoSearch(await fetchJSON(url, signal)).slice(0, 3);
+}
+
+async function searchPlaces(q, near, signal) {
+  const params = new URLSearchParams({ q, limit: '8', lang: 'en', bbox: NYC_BBOX });
+  if (near) { params.set('lat', near.lat.toFixed(4)); params.set('lon', near.lon.toFixed(4)); }
+  return sortBranches(parsePhoton(await fetchJSON(`${PHOTON_URL}?${params}`, signal)), near).slice(0, 5);
+}
+
+/** Typed text -> one point (used when an address is typed but no suggestion was picked). */
 async function geocode(text) {
   const q = String(text || '').trim();
   if (!q) throw new Error('empty');
-  const url = `${GEOSEARCH_URL}?text=${encodeURIComponent(q)}&size=1`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  const f = json && json.features && json.features[0];
-  if (!f || !f.geometry || !Array.isArray(f.geometry.coordinates)) throw new Error('not found');
-  const [lon, lat] = f.geometry.coordinates;
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) throw new Error('not found');
-  return { lat, lon, label: (f.properties && f.properties.label) || q };
+  const address = async () => {
+    const res = parseGeoSearch(await fetchJSON(`${GEOSEARCH_URL}/search?text=${encodeURIComponent(q)}&size=1`));
+    if (!res.length) throw new Error('not found');
+    return res[0];
+  };
+  const place = async () => {
+    const res = await searchPlaces(q, null);
+    if (!res.length) throw new Error('not found');
+    return res[0];
+  };
+  // "413 6th St" is an address; "Via Carota" is a place (GeoSearch would fuzzy-match a street).
+  const [first, second] = /^\d/.test(q) ? [address, place] : [place, address];
+  try { return await first(); } catch (e) { return second(); }
 }
 
 /* =====================================================================
@@ -229,8 +344,14 @@ function stationNote(st) {
   return null;
 }
 
+function formatMiles(d) {
+  if (!Number.isFinite(d)) return '';
+  if (d < 0.1) return '<0.1 mi';
+  return d < 10 ? `${d.toFixed(1)} mi` : `${Math.round(d)} mi`;
+}
+
 /* =====================================================================
- * State: favorites, recents, toggle, location
+ * State: favorites, recents, nicknames, per-card modes, location
  * ===================================================================== */
 let idCounter = 0;
 function newId() { idCounter += 1; return `f${Date.now().toString(36)}${idCounter}`; }
@@ -251,21 +372,45 @@ function loadFavorites() {
   }));
 }
 
+/** Recents: [{name, sub, lat, lon}], newest first. Older {address} entries are migrated. */
 function loadRecents() {
   const saved = loadJSON(STORAGE_KEYS.recents, []);
   if (!Array.isArray(saved)) return [];
   return saved
-    .filter((r) => r && typeof r.address === 'string' && Number.isFinite(r.lat) && Number.isFinite(r.lon))
+    .filter((r) => r && (typeof r.name === 'string' || typeof r.address === 'string') &&
+      Number.isFinite(r.lat) && Number.isFinite(r.lon))
+    .map((r) => ({ name: r.name || r.address, sub: r.sub || '', lat: r.lat, lon: r.lon }))
     .slice(0, MAX_RECENTS);
 }
 
-function normAddress(a) { return String(a).trim().toLowerCase().replace(/\s+/g, ' '); }
+function loadNicknames() {
+  const saved = loadJSON(STORAGE_KEYS.nicknames, {});
+  const out = {};
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+    for (const [k, v] of Object.entries(saved)) if (typeof v === 'string' && v.trim()) out[k] = v.trim();
+  }
+  return out;
+}
+
+/** Set (or clear, with an empty name) a station nickname. Returns a new map. */
+function setNickname(nicknames, stationId, name, officialName) {
+  const out = { ...nicknames };
+  const v = String(name || '').trim();
+  if (!v || v === officialName) delete out[stationId]; else out[stationId] = v;
+  return out;
+}
+
+function displayName(station, nicknames) {
+  return (nicknames && nicknames[station.id]) || station.name;
+}
+
+function norm(s) { return String(s).trim().toLowerCase().replace(/\s+/g, ' '); }
 
 /** Newest first, de-duplicated, capped at 3 (a new lookup drops the oldest). */
 function addRecent(recents, entry) {
-  const key = normAddress(entry.address);
-  const rest = recents.filter((r) => normAddress(r.address) !== key);
-  return [{ address: entry.address, lat: entry.lat, lon: entry.lon }, ...rest].slice(0, MAX_RECENTS);
+  const key = norm(`${entry.name}|${entry.sub || ''}`);
+  const rest = recents.filter((r) => norm(`${r.name}|${r.sub || ''}`) !== key);
+  return [{ name: entry.name, sub: entry.sub || '', lat: entry.lat, lon: entry.lon }, ...rest].slice(0, MAX_RECENTS);
 }
 
 /** The Home favorite (tracked by id, so renaming or moving it keeps it Home). */
@@ -279,27 +424,39 @@ function homeCoords(favorites) {
   return home ? { lat: home.lat, lon: home.lon } : { lat: DEFAULT_FAVORITES[0].lat, lon: DEFAULT_FAVORITES[0].lon };
 }
 
-/** Creates the per-open, in-memory app state. Toggle and location override are never stored. */
-function createState() {
+/** Which cards start expanded: phones show the first; wide screens show all. */
+function initialExpanded(favorites, wide) {
+  return new Set(wide ? favorites.map((f) => f.id) : favorites.slice(0, 1).map((f) => f.id));
+}
+
+/** Creates the per-open, in-memory app state. Modes, expansion and location override are never stored. */
+function createState({ wide = false } = {}) {
+  const favorites = loadFavorites();
   return {
-    favorites: loadFavorites(),
+    favorites,
     recents: loadRecents(),
-    mode: 'auto',                 // 'auto' | 'bikes' | 'docks' — memory only
+    nicknames: loadNicknames(),
+    modes: new Map(),             // card key -> 'auto' | 'bikes' | 'docks' (missing = auto) — memory only
+    expanded: initialExpanded(favorites, wide), // memory only
     gps: { status: 'pending', lat: null, lon: null }, // 'pending' | 'ok' | 'unavailable'
-    override: null,               // {kind: 'favorite'|'address', label, lat, lon} — memory only
+    override: null,               // {kind: 'favorite'|'place', id?, label, lat, lon} — memory only
     stations: [],
     status: new Map(),
     lastLoad: 0,
     lastAttempt: 0,
     refreshFailed: false,
     loading: false,
-    lookup: null,                 // {address, lat, lon}
+    lookup: null,                 // {name, sub, lat, lon}
+    picking: false,               // "Save as favorite" chooser open
     editing: false,
+    renaming: false,
     draft: null,
     saving: false,
     locOpen: false,
   };
 }
+
+function cardMode(st, key) { return st.modes.get(key) || 'auto'; }
 
 /** Where "my location" is right now, and what to call it in the header. */
 function myLocation(st) {
@@ -310,49 +467,63 @@ function myLocation(st) {
   return { ...home, source: st.gps.status === 'pending' ? 'GPS…' : `${hf ? hf.label : 'Home'} (no GPS)` };
 }
 
+function minutesAgo(t, now) { return Math.max(0, Math.floor((now - t) / 60000)); }
+
 function formatUpdated(lastLoad, now) {
   if (!lastLoad) return '';
-  const min = Math.floor((now - lastLoad) / 60000);
-  if (min < 1) return 'Updated just now';
-  return `Updated ${min} min ago`;
+  const min = minutesAgo(lastLoad, now);
+  return min < 1 ? 'Updated just now' : `Updated ${min} min ago`;
 }
 
 /* =====================================================================
  * Browser app
  * ===================================================================== */
+const ICONS = {
+  bike: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="16.5" r="3.5"/><circle cx="18.5" cy="16.5" r="3.5"/><path d="M5.5 16.5 9 9h6.5l3 7.5M12 16.5 9 9M8 6h3M15.5 9l-1.2-3H17"/></svg>',
+  dock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="4"/><path d="M10 17V7.5h3.2a2.8 2.8 0 0 1 0 5.6H10"/></svg>',
+  bolt: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M13.5 2 4.5 13.5h6L9.5 22l9-11.5h-6z"/></svg>',
+  pin: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>',
+  pinOutline: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 21s7-6.1 7-12a7 7 0 0 0-14 0c0 5.9 7 12 7 12z"/><circle cx="12" cy="9" r="2.5"/></svg>',
+  store: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10h16M5 10l1.2-5h11.6L19 10M6 10v10h12V10M10 20v-5h4v5"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>',
+  chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  grip: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>',
+};
+
 function bootApp() {
-  const state = createState();
+  const wideMq = window.matchMedia(WIDE_QUERY);
+  const state = createState({ wide: wideMq.matches });
   globalThis.__jb = state; // handy for debugging in DevTools
 
   const $ = (sel) => document.querySelector(sel);
   const els = {
     updated: $('#updated'),
-    toggle: $('.toggle'),
+    failLine: $('#failLine'),
     locBtn: $('#locBtn'),
     locLabel: $('#locLabel'),
     locPanel: $('#locPanel'),
     locChoices: $('#locChoices'),
-    locForm: $('#locForm'),
     locInput: $('#locInput'),
-    locMsg: $('#locMsg'),
+    locSuggest: $('#locSuggest'),
+    allBtn: $('#allBtn'),
+    q: $('#q'),
+    qClear: $('#qClear'),
+    suggest: $('#suggest'),
+    cards: $('#cards'),
     editBtn: $('#editBtn'),
-    favList: $('#favList'),
-    lookupForm: $('#lookupForm'),
-    lookupInput: $('#lookupInput'),
-    lookupMsg: $('#lookupMsg'),
-    recents: $('#recents'),
-    recentList: $('#recentList'),
-    lookupResults: $('#lookupResults'),
     ptr: $('#ptr'),
   };
 
-  /** Tiny element builder; all text goes through textContent. */
+  /** Tiny element builder; all text goes through textContent. `icon` inserts a trusted ICONS svg. */
   function h(tag, attrs, ...children) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v == null || v === false) continue;
       if (k === 'class') el.className = v;
       else if (k === 'text') el.textContent = v;
+      else if (k === 'icon') el.innerHTML = ICONS[v];
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v === true ? '' : v);
     }
@@ -362,9 +533,11 @@ function bootApp() {
     }
     return el;
   }
+  const icon = (name, cls = 'ic') => h('span', { class: cls, icon: name, 'aria-hidden': 'true' });
 
   /* ---------------- Data loading ---------------- */
   let feedsPromise = null;
+  let vehicleTypes = null; // only fetched if the feed ever switches to vehicle_types_available
 
   function restoreStationCache() {
     const cached = loadJSON(STORAGE_KEYS.stationInfo, null);
@@ -403,14 +576,12 @@ function bootApp() {
     saveJSON(STORAGE_KEYS.lastStatus, { savedAt, rows });
   }
 
-  let vehicleTypes = null; // only fetched if the feed ever switches to vehicle_types_available
-
   /** On open: station_information + station_status. On pull-down: status only. */
   async function refresh({ withInfo = false } = {}) {
     if (state.loading) return;
     state.loading = true;
     state.lastAttempt = Date.now();
-    renderUpdated();
+    renderStatus();
     try {
       if (!feedsPromise) feedsPromise = discoverFeeds();
       const feeds = await feedsPromise;
@@ -468,30 +639,31 @@ function bootApp() {
 
   /* ---------------- Rendering ---------------- */
   function render() {
-    renderUpdated();
-    renderToggle();
+    renderStatus();
     renderLocation();
-    if (!state.editing) renderFavorites();
-    renderRecents();
-    renderLookup();
+    if (!state.editing && !state.renaming) renderCards();
   }
 
-  function renderUpdated() {
-    const parts = [];
-    if (state.lastLoad) parts.push(formatUpdated(state.lastLoad, Date.now()));
-    else if (state.loading) parts.push('Loading…');
-    if (state.loading && state.lastLoad) parts.push('· Refreshing…');
-    els.updated.replaceChildren(parts.join(' '));
-    if (state.refreshFailed && !state.loading) {
-      if (parts.length) els.updated.append(' · ');
-      els.updated.append(h('span', { class: 'fail', text: "Couldn't refresh" }));
-    }
-  }
+  function renderStatus() {
+    const now = Date.now();
+    let text = state.lastLoad ? formatUpdated(state.lastLoad, now) : (state.loading ? 'Loading…' : '');
+    if (state.loading && state.lastLoad) text = 'Refreshing…';
+    els.updated.textContent = text;
 
-  function renderToggle() {
-    for (const b of els.toggle.querySelectorAll('button')) {
-      b.setAttribute('aria-checked', String(b.dataset.mode === state.mode));
+    const showFail = state.refreshFailed && !state.loading;
+    els.failLine.hidden = !showFail;
+    if (showFail) {
+      if (!state.lastLoad) els.failLine.textContent = "Couldn't load stations. Pull down to try again.";
+      else {
+        const m = minutesAgo(state.lastLoad, now);
+        els.failLine.textContent = `Couldn't refresh · showing data from ${m < 1 ? 'just now' : `${m} min ago`}`;
+      }
     }
+
+    const all = state.favorites.length > 0 && state.favorites.every((f) => state.expanded.has(f.id));
+    els.allBtn.textContent = all ? 'Collapse all' : 'Expand all';
+    els.allBtn.hidden = state.editing;
+    document.body.classList.toggle('is-editing', state.editing);
   }
 
   function renderLocation() {
@@ -515,188 +687,430 @@ function bootApp() {
     els.locChoices.replaceChildren(...chips);
   }
 
-  function stationRow(station, me) {
-    const st = state.status.get(station.id);
-    const name = h('span', { class: 'name', text: station.name });
-    if (!state.lastLoad && !state.status.size) {
-      return h('li', { class: 'row' }, name, h('span', { class: 'pending', text: '…' }));
-    }
-    const note = stationNote(st);
-    if (note) {
-      return h('li', { class: 'row off' }, name, h('span', { class: 'note', text: note }));
-    }
-    const mode = rowMode(state.mode, station, me);
-    let val;
+  /** The big availability tile. Bikes = solid fill (e-bikes ⚡ + classic); docks = dashed outline. */
+  function tile(st, mode) {
     if (mode === 'bikes') {
-      val = h('span', { class: 'val', 'aria-label': `${st.ebikes} e-bikes, ${st.classic} classic bikes` },
-        h('span', { class: 'unit', text: 'Bikes' }),
-        h('span', { class: `big ${colorClass(st.ebikes)}`, text: String(st.ebikes) }),
-        h('span', { class: `small ${colorClass(st.classic)}`, text: `(${st.classic})` }));
+      return h('span', { class: 'tile bikes', role: 'img', 'aria-label': `${st.ebikes} e-bikes, ${st.classic} classic bikes` },
+        h('span', { class: `seg main ${colorClass(st.ebikes)}` }, icon('bolt', 'ic bolt'), h('span', { class: 'n', text: String(st.ebikes) })),
+        h('span', { class: `seg classic ${colorClass(st.classic)}`, text: String(st.classic) }));
+    }
+    return h('span', { class: `tile docks ${colorClass(st.docks)}`, role: 'img', 'aria-label': `${st.docks} open docks` },
+      icon('dock', 'ic dockic'), h('span', { class: 'n', text: String(st.docks) }));
+  }
+
+  function miniTile(st, mode) {
+    if (!st || stationNote(st)) return h('span', { class: 'mini off', 'aria-hidden': 'true', text: '–' });
+    if (mode === 'bikes') return h('span', { class: `mini bikes ${colorClass(st.ebikes)}`, text: String(st.ebikes) });
+    return h('span', { class: `mini docks ${colorClass(st.docks)}`, text: String(st.docks) });
+  }
+
+  function stationRow(station, key, me) {
+    const st = state.status.get(station.id);
+    const nameText = displayName(station, state.nicknames);
+    const name = h('span', { class: 'name', text: nameText });
+    let right;
+    let off = false;
+    if (!state.status.size) right = h('span', { class: 'tile pending', text: '…' });
+    else if (stationNote(st)) { off = true; right = h('span', { class: 'tile note', text: stationNote(st) }); }
+    else right = tile(st, rowMode(cardMode(state, key), station, me));
+    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, name, right);
+    onLongPress(row, () => startRename(name, {
+      value: state.nicknames[station.id] || '',
+      placeholder: station.name,
+      hint: `Official name: ${station.name} · clear to reset`,
+      onCommit: (v) => {
+        state.nicknames = setNickname(state.nicknames, station.id, v, station.name);
+        saveJSON(STORAGE_KEYS.nicknames, state.nicknames);
+      },
+    }));
+    return row;
+  }
+
+  function modeControl(key) {
+    const cur = cardMode(state, key);
+    const opt = (mode, content, label) => h('button', {
+      type: 'button', role: 'radio', 'aria-checked': String(cur === mode), 'aria-label': label,
+      class: `mode-btn${cur === mode ? ' on' : ''}`,
+      onclick: (e) => { e.stopPropagation(); state.modes.set(key, mode); render(); },
+    }, h('span', { class: 'face' }, content));
+    return h('div', { class: 'modes', role: 'radiogroup', 'aria-label': 'Show' },
+      opt('auto', 'Auto', 'Auto'), opt('bikes', icon('bike'), 'Bikes'), opt('docks', icon('dock'), 'Docks'));
+  }
+
+  function stationList(lat, lon) {
+    if (!state.stations.length) return null;
+    return closestStations(lat, lon, state.stations);
+  }
+
+  function favoriteCard(f, me) {
+    const open = state.expanded.has(f.id);
+    const mode = cardMode(state, f.id);
+    const stations = stationList(f.lat, f.lon);
+    const nameEl = h('span', { class: 'card-name', text: f.label });
+    const toggle = h('button', {
+      type: 'button', class: 'card-toggle', 'aria-expanded': String(open),
+      onclick: (e) => {
+        if (toggle.dataset.lp) { delete toggle.dataset.lp; return; }
+        if (state.expanded.has(f.id)) state.expanded.delete(f.id); else state.expanded.add(f.id);
+        render();
+      },
+    }, icon('chevron', 'ic chev'), nameEl);
+    if (!open && stations && state.status.size) {
+      toggle.append(h('span', { class: 'minis' },
+        stations.map((s) => miniTile(state.status.get(s.id), rowMode(mode, s, me)))));
+    }
+    onLongPress(toggle, () => startRename(toggle, {
+      value: f.label, placeholder: 'Name', hint: 'Rename this place · Enter to save',
+      onCommit: (v) => {
+        if (!v) return;
+        f.label = v;
+        saveJSON(STORAGE_KEYS.favorites, state.favorites);
+        if (state.override && state.override.kind === 'favorite' && state.override.id === f.id) state.override.label = v;
+      },
+    }));
+    const head = h('div', { class: 'card-head' }, toggle, open ? modeControl(f.id) : null);
+    const card = h('section', { class: `card${open ? ' open' : ''}`, 'data-id': f.id }, head);
+    if (open) {
+      if (!stations) card.append(h('p', { class: 'empty', text: state.loading ? 'Loading stations…' : "Couldn't load stations." }));
+      else card.append(h('ul', { class: 'rows' }, stations.map((s) => stationRow(s, f.id, me))));
+    }
+    return card;
+  }
+
+  function lookupCard(me) {
+    const L = state.lookup;
+    const stations = stationList(L.lat, L.lon);
+    const card = h('section', { class: 'card open lookup', 'aria-label': `Stations near ${L.name}` },
+      h('div', { class: 'card-head' },
+        h('div', { class: 'lookup-title' },
+          h('span', { class: 'card-name', text: L.name }),
+          L.sub ? h('span', { class: 'card-sub', text: L.sub }) : null),
+        modeControl('lookup'),
+        h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Close', icon: 'x', onclick: closeLookup })));
+    if (!stations) card.append(h('p', { class: 'empty', text: 'Loading stations…' }));
+    else card.append(h('ul', { class: 'rows' }, stations.map((s) => stationRow(s, 'lookup', me))));
+
+    if (state.picking) {
+      card.append(h('div', { class: 'picker' },
+        h('p', { class: 'picker-title', text: 'Replace which favorite?' }),
+        h('div', { class: 'chips' },
+          state.favorites.map((f) => h('button', { type: 'button', class: 'chip', onclick: () => saveLookupAsFavorite(f.id) }, f.label)),
+          h('button', { type: 'button', class: 'chip ghost', onclick: () => { state.picking = false; render(); } }, 'Cancel'))));
     } else {
-      val = h('span', { class: 'val', 'aria-label': `${st.docks} open docks` },
-        h('span', { class: 'unit', text: 'Docks' }),
-        h('span', { class: `big ${colorClass(st.docks)}`, text: String(st.docks) }));
+      card.append(h('div', { class: 'card-actions' },
+        h('button', { type: 'button', class: 'text-btn', onclick: () => setOverride({ kind: 'place', label: L.name, lat: L.lat, lon: L.lon }) },
+          icon('pin'), 'Set as my location'),
+        h('button', { type: 'button', class: 'text-btn', onclick: () => { state.picking = true; render(); } },
+          '★ Save as favorite')));
     }
-    return h('li', { class: 'row' }, name, val);
+    return card;
   }
 
-  function placeBlock(title, lat, lon, me) {
-    const block = h('div', { class: 'place' }, h('h3', { class: 'place-head', text: title }));
-    if (!state.stations.length) {
-      block.append(h('p', { class: 'empty', text: state.loading ? 'Loading stations…' : "Couldn't load stations." }));
-      return block;
-    }
-    const rows = h('ul', { class: 'rows' });
-    for (const s of closestStations(lat, lon, state.stations)) rows.append(stationRow(s, me));
-    block.append(rows);
-    return block;
-  }
-
-  function renderFavorites() {
-    els.editBtn.textContent = 'Edit';
+  function renderCards() {
     els.editBtn.hidden = false;
+    els.cards.classList.remove('editing');
     const me = myLocation(state);
-    if (!state.favorites.length) {
-      els.favList.replaceChildren(h('p', { class: 'empty', text: 'No favorites. Tap Edit to add one.' }));
-      return;
-    }
-    els.favList.replaceChildren(...state.favorites.map((f) => placeBlock(f.label, f.lat, f.lon, me)));
+    const cards = [];
+    if (state.lookup) cards.push(lookupCard(me));
+    for (const f of state.favorites) cards.push(favoriteCard(f, me));
+    els.cards.replaceChildren(...cards);
   }
 
-  function renderRecents() {
-    els.recents.hidden = !state.recents.length;
-    els.recentList.replaceChildren(...state.recents.map((r) => h('li', null,
-      h('button', { type: 'button', onclick: () => showLookup(r) }, r.address))));
-  }
-
-  function renderLookup() {
-    if (!state.lookup) { els.lookupResults.replaceChildren(); return; }
-    const me = myLocation(state);
-    els.lookupResults.replaceChildren(placeBlock(state.lookup.address, state.lookup.lat, state.lookup.lon, me));
-  }
-
-  /* ---------------- Toggle and location controls ---------------- */
-  els.toggle.addEventListener('click', (e) => {
-    const b = e.target.closest('button[data-mode]');
-    if (!b) return;
-    state.mode = b.dataset.mode;
-    render();
-  });
-
+  /* ---------------- Location control ---------------- */
   els.locBtn.addEventListener('click', () => {
     state.locOpen = !state.locOpen;
-    els.locMsg.textContent = '';
+    if (!state.locOpen) locSearch.close();
     render();
   });
 
   function setOverride(ov) {
     state.override = ov;
     state.locOpen = false;
-    els.locInput.value = '';
-    els.locMsg.textContent = '';
+    locSearch.close();
     if (!ov && state.gps.status !== 'ok') requestGps();
     render();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  els.locForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const text = els.locInput.value.trim();
-    if (!text) return;
-    const btn = els.locForm.querySelector('button');
-    btn.disabled = true;
-    els.locMsg.textContent = '';
-    try {
-      const g = await geocode(text);
-      setOverride({ kind: 'address', label: text, lat: g.lat, lon: g.lon });
-    } catch (err) {
-      els.locMsg.textContent = "Couldn't find that address.";
-    } finally {
-      btn.disabled = false;
-    }
-  });
-
-  /* ---------------- Address lookup ---------------- */
-  function showLookup(entry) {
-    state.lookup = { address: entry.address, lat: entry.lat, lon: entry.lon };
-    state.recents = addRecent(state.recents, entry);
-    saveJSON(STORAGE_KEYS.recents, state.recents);
-    els.lookupMsg.textContent = '';
+  els.allBtn.addEventListener('click', () => {
+    const all = state.favorites.every((f) => state.expanded.has(f.id));
+    state.expanded = all ? new Set() : new Set(state.favorites.map((f) => f.id));
     render();
-    els.lookupResults.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+
+  /* ---------------- Search (addresses + places, with confirmation) ---------------- */
+  function suggestionButton(item, me, onPick, iconName) {
+    const d = me ? haversineMi(me.lat, me.lon, item.lat, item.lon) : NaN;
+    const sub = [item.category, item.sub].filter(Boolean).join(' · ');
+    return h('li', null, h('button', {
+      type: 'button', class: 'sug',
+      onclick: () => onPick(item),
+    },
+    icon(iconName || (item.kind === 'place' ? 'store' : 'pinOutline'), 'ic sug-ic'),
+    h('span', { class: 'sug-text' },
+      h('span', { class: 'sug-name', text: item.name }),
+      sub ? h('span', { class: 'sug-sub', text: sub }) : null),
+    item.recent ? null : h('span', { class: 'sug-dist', text: formatMiles(d) })));
   }
 
-  els.lookupForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const text = els.lookupInput.value.trim();
-    if (!text) return;
-    const btn = els.lookupForm.querySelector('button');
-    btn.disabled = true;
-    els.lookupMsg.textContent = '';
-    try {
-      const g = await geocode(text);
-      els.lookupInput.value = '';
-      els.lookupInput.blur();
-      showLookup({ address: text, lat: g.lat, lon: g.lon });
-    } catch (err) {
-      els.lookupMsg.textContent = "Couldn't find that address.";
-    } finally {
-      btn.disabled = false;
-    }
+  /**
+   * Type-ahead search. Shows places (Photon) and addresses (GeoSearch) as you type;
+   * the user confirms by tapping one. Returns {close()}.
+   */
+  function attachSearch(input, box, { onPick, recents }) {
+    let timer = null;
+    let ctrl = null;
+    let seq = 0;
+    const wrap = input.closest('.search-wrap') || input.parentElement;
+
+    const open = (sections) => {
+      box.replaceChildren(...sections);
+      box.hidden = !sections.length;
+      wrap.classList.toggle('has-sug', !box.hidden);
+    };
+    const close = () => {
+      clearTimeout(timer);
+      if (ctrl) ctrl.abort();
+      box.hidden = true;
+      box.replaceChildren();
+      wrap.classList.remove('has-sug');
+    };
+    const pick = (item) => {
+      close();
+      input.value = '';
+      input.dispatchEvent(new Event('change'));
+      input.blur();
+      onPick(item);
+    };
+    const section = (title, items, iconName) => h('div', { class: 'sug-sec' },
+      h('p', { class: 'sug-title', text: title }),
+      h('ul', { class: 'sug-list' }, items.map((it) => suggestionButton(it, myLocation(state), pick, iconName))));
+
+    const showRecents = () => {
+      const list = recents ? recents() : [];
+      if (!list.length) { close(); return; }
+      open([section('Recent', list.map((r) => ({ ...r, recent: true })), 'clock')]);
+    };
+
+    const run = async (q) => {
+      clearTimeout(timer);
+      if (ctrl) ctrl.abort();
+      ctrl = new AbortController();
+      const mine = ++seq;
+      open([h('p', { class: 'sug-note', text: 'Searching…' })]);
+      const near = myLocation(state);
+      const [places, addrs] = await Promise.allSettled([
+        searchPlaces(q, near, ctrl.signal),
+        /\d/.test(q) ? searchAddresses(q, ctrl.signal) : Promise.resolve([]),
+      ]);
+      if (mine !== seq) return; // a newer query is in flight
+      const P = places.status === 'fulfilled' ? places.value : [];
+      const A = addrs.status === 'fulfilled' ? addrs.value : [];
+      const secs = [];
+      if (A.length && /^\d/.test(q)) secs.push(section('Addresses', A));
+      if (P.length) secs.push(section('Places', P));
+      if (A.length && !/^\d/.test(q)) secs.push(section('Addresses', A));
+      if (!secs.length) {
+        const failed = places.status === 'rejected' && addrs.status !== 'fulfilled';
+        secs.push(h('p', { class: 'sug-note', text: failed ? "Search isn't reachable right now." : 'No matches. Try a street address or a place name.' }));
+      }
+      open(secs);
+    };
+
+    input.addEventListener('input', () => {
+      const q = input.value.trim();
+      clearTimeout(timer);
+      if (q.length < 3) { if (!q) showRecents(); else close(); return; }
+      timer = setTimeout(() => run(q), 280);
+    });
+    input.addEventListener('focus', () => { if (!input.value.trim()) showRecents(); });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { close(); input.blur(); }
+      if (e.key === 'Enter') { e.preventDefault(); const q = input.value.trim(); if (q) run(q); }
+    });
+    document.addEventListener('pointerdown', (e) => {
+      if (!box.hidden && !wrap.contains(e.target) && !box.contains(e.target)) close();
+    });
+    return { close };
+  }
+
+  const mainSearch = attachSearch(els.q, els.suggest, {
+    onPick: (item) => showLookup(item),
+    recents: () => state.recents,
   });
+  const locSearch = attachSearch(els.locInput, els.locSuggest, {
+    onPick: (item) => setOverride({ kind: 'place', label: item.name, lat: item.lat, lon: item.lon }),
+  });
+  const syncClear = () => { els.qClear.hidden = !els.q.value; };
+  els.q.addEventListener('input', syncClear);
+  els.q.addEventListener('change', syncClear);
+  els.qClear.addEventListener('click', () => { els.q.value = ''; syncClear(); mainSearch.close(); els.q.focus(); });
+
+  function showLookup(item) {
+    state.lookup = { name: item.name, sub: item.sub || '', lat: item.lat, lon: item.lon };
+    state.modes.delete('lookup');
+    state.picking = false;
+    state.recents = addRecent(state.recents, item);
+    saveJSON(STORAGE_KEYS.recents, state.recents);
+    render();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function closeLookup() {
+    state.lookup = null;
+    state.picking = false;
+    render();
+  }
+
+  function saveLookupAsFavorite(slotId) {
+    const L = state.lookup;
+    const i = state.favorites.findIndex((f) => f.id === slotId);
+    if (!L || i < 0) return;
+    state.favorites[i] = { id: slotId, label: L.name, address: [L.name, L.sub].filter(Boolean).join(', '), lat: L.lat, lon: L.lon };
+    saveJSON(STORAGE_KEYS.favorites, state.favorites);
+    state.lookup = null;
+    state.picking = false;
+    state.expanded.add(slotId);
+    render();
+    const el = els.cards.querySelector(`[data-id="${slotId}"]`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  /* ---------------- Rename (long-press any place or station name) ---------------- */
+  function onLongPress(el, cb) {
+    let timer = null;
+    let sx = 0, sy = 0;
+    const cancel = () => { clearTimeout(timer); timer = null; };
+    el.addEventListener('pointerdown', (e) => {
+      if (state.editing || state.renaming || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      if (e.target.closest('input, .modes')) return;
+      sx = e.clientX; sy = e.clientY;
+      cancel();
+      timer = setTimeout(() => {
+        timer = null;
+        el.dataset.lp = '1';
+        try { if (navigator.vibrate) navigator.vibrate(12); } catch (err) { /* ignore */ }
+        cb();
+      }, 500);
+    });
+    el.addEventListener('pointermove', (e) => { if (timer && Math.hypot(e.clientX - sx, e.clientY - sy) > 10) cancel(); });
+    el.addEventListener('pointerup', cancel);
+    el.addEventListener('pointercancel', cancel);
+    el.addEventListener('pointerleave', cancel);
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  /** Swap `target` for an inline text field (placed beside it, never inside a button). */
+  function startRename(target, { value, placeholder, hint, onCommit }) {
+    state.renaming = true;
+    const input = h('input', {
+      class: 'rename', type: 'text', value, placeholder, maxlength: '48',
+      enterkeyhint: 'done', 'aria-label': 'New name',
+    });
+    const block = h('span', { class: 'rename-block' }, input,
+      h('span', { class: 'rename-hint', text: hint }));
+    target.hidden = true;
+    target.parentNode.insertBefore(block, target);
+    let done = false;
+    const finish = (save) => {
+      if (done) return;
+      done = true;
+      state.renaming = false;
+      if (save) onCommit(input.value.trim());
+      render();
+    };
+    for (const ev of ['click', 'pointerdown', 'pointerup']) block.addEventListener(ev, (e) => e.stopPropagation());
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+    // The finger (or mouse button) is still down. Focus when it lifts: on Android that
+    // release counts as a user gesture, which is what lets the keyboard open.
+    window.addEventListener('pointerup', () => {
+      if (!done) setTimeout(() => { input.focus(); input.select(); }, 0);
+    }, { once: true, capture: true });
+  }
 
   /* ---------------- Edit mode ---------------- */
   els.editBtn.addEventListener('click', () => {
     if (state.editing) return;
+    mainSearch.close();
     state.editing = true;
-    state.draft = state.favorites.map((f) => ({ ...f, origAddress: f.address, error: '' }));
+    state.draft = state.favorites.map((f) => ({ ...f, origAddress: f.address, error: '', names: {} }));
     renderEditor();
   });
 
   function renderEditor() {
     els.editBtn.hidden = true;
+    renderStatus();
+    els.cards.classList.add('editing');
     const wrap = h('div', { class: 'editor' },
-      h('p', { class: 'hint', text: 'Drag ≡ to reorder. Addresses are looked up when you save.' }));
+      h('p', { class: 'hint', text: 'Drag ⠿ to reorder. Pick an address or place from the suggestions, or type one.' }));
     const list = h('div', { class: 'edit-list' });
     for (const f of state.draft) list.append(editCard(f, list));
-    wrap.append(list);
-    // Always exactly the favorites I have (max 5): no add/remove, only edit, reorder, replace.
-    const foot = h('div', { class: 'editor-foot' });
-    foot.append(h('div', { class: 'right' },
+    wrap.append(list, h('div', { class: 'editor-foot' },
       h('button', { type: 'button', class: 'btn secondary', onclick: cancelEdit, disabled: state.saving }, 'Cancel'),
       h('button', { type: 'button', class: 'btn', onclick: () => saveEdits(list), disabled: state.saving },
         state.saving ? 'Saving…' : 'Save')));
-    wrap.append(foot);
-    els.favList.replaceChildren(wrap);
+    els.cards.replaceChildren(wrap);
   }
 
   function editCard(f, list) {
     const label = h('input', {
-      class: 'lbl', type: 'text', value: f.label, placeholder: 'Label', 'aria-label': 'Label', maxlength: '40',
+      class: 'lbl', type: 'text', value: f.label, placeholder: 'Name', 'aria-label': 'Name', maxlength: '40',
       oninput: (e) => { f.label = e.target.value; },
     });
     const addr = h('input', {
-      type: 'text', value: f.address, placeholder: 'Street address', 'aria-label': 'Address',
+      type: 'search', value: f.address, placeholder: 'Address or place', 'aria-label': 'Address or place',
       oninput: (e) => { f.address = e.target.value; },
     });
+    const sugBox = h('div', { class: 'suggest', hidden: true });
+    const addrWrap = h('div', { class: 'search-wrap edit-addr' }, addr);
     const err = h('p', { class: 'card-err', role: 'alert', text: f.error || '' });
+    attachSearch(addr, sugBox, {
+      onPick: (item) => {
+        f.address = [item.name, item.sub].filter(Boolean).join(', ');
+        f.lat = item.lat; f.lon = item.lon; f.origAddress = f.address; f.error = '';
+        if (!f.label.trim()) { f.label = item.name; label.value = item.name; }
+        addr.value = f.address;
+        err.textContent = '';
+        renderStationNames();
+      },
+    });
+
+    const namesBox = h('div', { class: 'edit-stations' });
+    const renderStationNames = () => {
+      const stations = Number.isFinite(f.lat) && state.stations.length ? closestStations(f.lat, f.lon, state.stations) : [];
+      namesBox.replaceChildren(...(stations.length ? [h('p', { class: 'edit-sub', text: 'Station names' })] : []),
+        ...stations.map((s) => h('input', {
+          type: 'text', class: 'st-name', maxlength: '48', 'aria-label': `Name for ${s.name}`,
+          placeholder: s.name, value: f.names[s.id] != null ? f.names[s.id] : (state.nicknames[s.id] || ''),
+          oninput: (e) => { f.names[s.id] = e.target.value; },
+        })));
+    };
+    renderStationNames();
+
     const card = h('div', { class: 'edit-card', 'data-id': f.id },
-      h('button', { type: 'button', class: 'drag', 'aria-label': `Drag to reorder ${f.label || 'favorite'}` }, '≡'),
-      h('div', { class: 'edit-fields' }, label, addr, err),
-      h('div', { class: 'edit-actions' },
-        h('button', {
-          type: 'button', class: 'btn secondary',
-          onclick: () => {
-            f.label = ''; f.address = ''; f.lat = NaN; f.lon = NaN; f.error = '';
-            label.value = ''; addr.value = ''; err.textContent = '';
-            label.placeholder = 'New label'; addr.placeholder = 'New address';
-            label.focus();
-          },
-        }, 'Replace')));
+      h('button', { type: 'button', class: 'drag', 'aria-label': `Drag to reorder ${f.label || 'favorite'}`, icon: 'grip' }),
+      h('div', { class: 'edit-fields' },
+        h('div', { class: 'edit-row' }, label,
+          h('button', {
+            type: 'button', class: 'btn secondary small',
+            onclick: () => {
+              f.label = ''; f.address = ''; f.lat = NaN; f.lon = NaN; f.error = ''; f.names = {};
+              label.value = ''; addr.value = ''; err.textContent = '';
+              label.placeholder = 'New name'; addr.placeholder = 'New address or place';
+              renderStationNames();
+              label.focus();
+            },
+          }, 'Replace')),
+        addrWrap, sugBox, err, namesBox));
     makeDraggable(card, list);
     return card;
   }
 
-  /** Pointer-based drag on the ≡ handle; works with touch, mouse and pen. */
+  /** Pointer-based drag on the ⠿ handle; works with touch, mouse and pen. */
   function makeDraggable(card, list) {
     const handle = card.querySelector('.drag');
     handle.addEventListener('pointerdown', (e) => {
@@ -764,8 +1178,8 @@ function bootApp() {
     for (const f of draft) {
       f.label = f.label.trim();
       f.address = f.address.trim();
-      f.error = !f.label && !f.address ? 'Enter a label and an address.'
-        : !f.label ? 'Enter a label.' : !f.address ? 'Enter an address.' : '';
+      f.error = !f.label && !f.address ? 'Enter a name and an address.'
+        : !f.label ? 'Enter a name.' : !f.address ? 'Enter an address or place.' : '';
       if (f.error) bad = true;
     }
     if (bad) { renderEditor(); return; }
@@ -778,13 +1192,22 @@ function bootApp() {
         const g = await geocode(f.address);
         f.lat = g.lat; f.lon = g.lon; f.origAddress = f.address;
       } catch (e) {
-        f.error = "Couldn't find that address.";
+        f.error = "Couldn't find that address. Pick one from the suggestions.";
         bad = true;
       }
     }));
     state.saving = false;
     if (bad) { renderEditor(); return; }
 
+    let nick = state.nicknames;
+    for (const f of draft) {
+      for (const [id, v] of Object.entries(f.names)) {
+        const s = state.stations.find((x) => x.id === id);
+        nick = setNickname(nick, id, v, s ? s.name : '');
+      }
+    }
+    state.nicknames = nick;
+    saveJSON(STORAGE_KEYS.nicknames, nick);
     state.favorites = draft.map(({ id, label, address, lat, lon }) => ({ id, label, address, lat, lon }));
     saveJSON(STORAGE_KEYS.favorites, state.favorites);
     // Keep a favorite-based location override pointing at the edited favorite.
@@ -822,8 +1245,8 @@ function bootApp() {
     };
 
     window.addEventListener('touchstart', (e) => {
-      if (state.editing || state.loading || e.touches.length !== 1 || window.scrollY > 0 ||
-          e.target.closest('input, .drag')) {
+      if (state.editing || state.renaming || state.loading || e.touches.length !== 1 || window.scrollY > 0 ||
+          e.target.closest('input, .drag, .suggest')) {
         startY = null;
         return;
       }
@@ -876,12 +1299,12 @@ function bootApp() {
   setupPullToRefresh();
 
   // Keep "Updated N min ago" current (display only — no data is fetched on a timer).
-  setInterval(renderUpdated, 15000);
+  setInterval(renderStatus, 15000);
 
-  // Android keeps PWAs alive in the background; returning to the app counts as opening it.
+  // Android keeps PWAs alive in the background; returning to the app refreshes the data.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
-    renderUpdated();
+    renderStatus();
     if (Date.now() - state.lastAttempt > 60000) {
       if (!state.override) requestGps();
       refresh({ withInfo: true });
@@ -904,9 +1327,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
  * ===================================================================== */
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_RECENTS, STORAGE_KEYS,
-    haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts,
+    AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_RECENTS, STORAGE_KEYS, HOME_ID,
+    haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts, formatMiles,
     parseStationInfo, parseStationStatus, parseVehicleTypes, feedsFromDiscovery,
-    addRecent, createState, myLocation, formatUpdated, loadFavorites, loadRecents, homeCoords,
+    parsePhoton, parseGeoSearch, prettyStreet, categoryLabel, sortBranches,
+    addRecent, setNickname, displayName, initialExpanded, cardMode,
+    createState, myLocation, formatUpdated, loadFavorites, loadRecents, loadNicknames, homeCoords,
   };
 }

@@ -2,7 +2,7 @@
  * Shell files are network-first (so deploys show up right away) with the cache
  * as an offline fallback. Station and geocoding data are cross-origin and are
  * never intercepted, so they always come straight from the network. */
-const CACHE = 'jb-shell-v1';
+const CACHE = 'jb-shell-v2';
 const SHELL = [
   '/',
   '/index.html',

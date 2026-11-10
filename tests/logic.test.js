@@ -107,26 +107,108 @@ test('station notes', () => {
   assert.equal(A.stationNote(undefined), 'Closed');
 });
 
-test('recents: capped at 3, newest first, de-duplicated', () => {
+test('recents: capped at 3, newest first, de-duplicated, old entries migrated', () => {
   let r = [];
-  for (const a of ['A st', 'B st', 'C st', 'D st']) r = A.addRecent(r, { address: a, lat: 1, lon: 1 });
-  assert.deepEqual(r.map((x) => x.address), ['D st', 'C st', 'B st']); // oldest (A) dropped
-  r = A.addRecent(r, { address: 'b ST', lat: 1, lon: 1 });
-  assert.deepEqual(r.map((x) => x.address), ['b ST', 'D st', 'C st']);
+  for (const a of ['A st', 'B st', 'C st', 'D st']) r = A.addRecent(r, { name: a, sub: 'Brooklyn', lat: 1, lon: 1 });
+  assert.deepEqual(r.map((x) => x.name), ['D st', 'C st', 'B st']); // oldest (A) dropped
+  r = A.addRecent(r, { name: 'b ST', sub: 'brooklyn', lat: 1, lon: 1 });
+  assert.deepEqual(r.map((x) => x.name), ['b ST', 'D st', 'C st']);
   assert.equal(r.length, A.MAX_RECENTS);
+  // Same name, different place (chain restaurants) are distinct
+  r = A.addRecent([], { name: "Joe's Pizza", sub: '7 Carmine St', lat: 1, lon: 1 });
+  r = A.addRecent(r, { name: "Joe's Pizza", sub: '150 E 14th St', lat: 2, lon: 2 });
+  assert.equal(r.length, 2);
+  localStorage.setItem(A.STORAGE_KEYS.recents, JSON.stringify([{ address: '1 Main St', lat: 1, lon: 2 }]));
+  assert.deepEqual(A.loadRecents(), [{ name: '1 Main St', sub: '', lat: 1, lon: 2 }]);
+  localStorage.removeItem(A.STORAGE_KEYS.recents);
 });
 
-test('toggle and location override reset on a fresh state (reload)', () => {
+test('station nicknames: set, clear, reset to official, display', () => {
+  let n = A.setNickname({}, 's1', '  Corner of 6th ', '5 St & 6 Ave');
+  assert.deepEqual(n, { s1: 'Corner of 6th' });
+  assert.equal(A.displayName({ id: 's1', name: '5 St & 6 Ave' }, n), 'Corner of 6th');
+  assert.equal(A.displayName({ id: 's2', name: '6 St & 7 Ave' }, n), '6 St & 7 Ave');
+  assert.deepEqual(A.setNickname(n, 's1', '', '5 St & 6 Ave'), {});
+  assert.deepEqual(A.setNickname(n, 's1', '5 St & 6 Ave', '5 St & 6 Ave'), {}); // same as official = reset
+  localStorage.setItem(A.STORAGE_KEYS.nicknames, JSON.stringify({ a: 'Mine', b: 5, c: '  ' }));
+  assert.deepEqual(A.loadNicknames(), { a: 'Mine' });
+  localStorage.setItem(A.STORAGE_KEYS.nicknames, '[1,2]');
+  assert.deepEqual(A.loadNicknames(), {});
+  localStorage.removeItem(A.STORAGE_KEYS.nicknames);
+});
+
+test('per-card modes default to Auto; first card expanded on phones, all on wide screens', () => {
+  const s = A.createState({ wide: false });
+  assert.equal(A.cardMode(s, s.favorites[1].id), 'auto');
+  assert.deepEqual([...s.expanded], [s.favorites[0].id]);
+  const w = A.createState({ wide: true });
+  assert.equal(w.expanded.size, 5);
+  s.modes.set(s.favorites[1].id, 'docks');
+  assert.equal(A.cardMode(s, s.favorites[1].id), 'docks');
+  assert.equal(A.cardMode(s, s.favorites[0].id), 'auto'); // independent per card
+});
+
+test('address prettifying', () => {
+  assert.equal(A.prettyStreet('413 6 STREET'), '413 6th St');
+  assert.equal(A.prettyStreet('540 EAST 71 STREET'), '540 E 71st St');
+  assert.equal(A.prettyStreet('39 CLAREMONT AVENUE'), '39 Claremont Ave');
+  assert.equal(A.prettyStreet('7 Carmine Street'), '7 Carmine St');
+  assert.equal(A.prettyStreet('100 WEST 112 STREET'), '100 W 112th St');
+  assert.equal(A.prettyStreet('1 EAST 161 STREET'), '1 E 161st St');
+  assert.equal(A.prettyStreet('5 EAST 13 STREET'), '5 E 13th St');
+});
+
+test('Photon places parsing (businesses), filters non-places', () => {
+  const json = { features: [
+    { geometry: { coordinates: [-74.0045, 40.733] }, properties: { name: 'Via Carota', osm_key: 'amenity', osm_value: 'restaurant', type: 'house', housenumber: '51', street: 'Grove Street', district: 'Manhattan', city: 'New York' } },
+    { geometry: { coordinates: [-73.97, 40.67] }, properties: { name: 'Crunch Fitness', osm_key: 'leisure', osm_value: 'fitness_centre', housenumber: '314', street: 'Flatbush Avenue', city: 'Brooklyn' } },
+    { geometry: { coordinates: [-73.9, 40.7] }, properties: { name: 'Grove Street', osm_key: 'highway', osm_value: 'residential' } },
+    { geometry: { coordinates: [-73.9, 40.7] }, properties: { osm_key: 'building', type: 'house', housenumber: '5' } },
+    { geometry: { coordinates: [-73.9, 40.7] }, properties: { name: 'Main Street', osm_key: 'place', osm_value: 'city' } },
+    { geometry: { coordinates: [-74.0045, 40.733] }, properties: { name: 'Via Carota', osm_key: 'amenity', osm_value: 'restaurant', housenumber: '51', street: 'Grove Street', district: 'Manhattan' } },
+  ] };
+  const r = A.parsePhoton(json);
+  assert.deepEqual(r, [
+    { kind: 'place', name: 'Via Carota', sub: '51 Grove St, Manhattan', category: 'Restaurant', lat: 40.733, lon: -74.0045 },
+    { kind: 'place', name: 'Crunch Fitness', sub: '314 Flatbush Ave, Brooklyn', category: 'Gym', lat: 40.67, lon: -73.97 },
+  ]);
+});
+
+test('GeoSearch address parsing keeps addresses only', () => {
+  const json = { features: [
+    { geometry: { coordinates: [-73.981835, 40.669765] }, properties: { label: '413 6 STREET, Brooklyn, NY, USA', layer: 'venue' } },
+    { geometry: { coordinates: [-73.95, 40.76] }, properties: { label: 'HOSPITAL FOR SPECIAL SURGERY, New York, NY, USA', layer: 'venue' } },
+  ] };
+  assert.deepEqual(A.parseGeoSearch(json), [{ kind: 'address', name: '413 6th St', sub: 'Brooklyn', lat: 40.669765, lon: -73.981835 }]);
+});
+
+test('same-name branches sorted nearest first; other places keep relevance order', () => {
+  const near = { lat: 40.67, lon: -73.98 };
+  const list = [
+    { name: "Joe's Pizza", lat: 40.73, lon: -74.0 },   // far
+    { name: 'Joes Bar', lat: 40.80, lon: -73.95 },
+    { name: "joe's pizza", lat: 40.671, lon: -73.98 }, // near
+  ];
+  assert.deepEqual(A.sortBranches(list, near).map((p) => `${p.name}@${p.lat}`), ["joe's pizza@40.671", "Joe's Pizza@40.73", 'Joes Bar@40.8']);
+});
+
+test('distance formatting for search suggestions', () => {
+  assert.equal(A.formatMiles(0.04), '<0.1 mi');
+  assert.equal(A.formatMiles(3.14159), '3.1 mi');
+  assert.equal(A.formatMiles(12.6), '13 mi');
+});
+
+test('modes, expansion and location override reset on a fresh state (reload)', () => {
   const s1 = A.createState();
-  assert.equal(s1.mode, 'auto');
-  assert.equal(s1.override, null);
-  s1.mode = 'docks';
-  s1.override = { kind: 'address', label: '1 Main St', lat: 40.7, lon: -74 };
+  s1.modes.set(s1.favorites[0].id, 'docks');
+  s1.expanded.add(s1.favorites[3].id);
+  s1.override = { kind: 'place', label: '1 Main St', lat: 40.7, lon: -74 };
   assert.equal(A.myLocation(s1).source, '1 Main St');
-  // Neither is persisted anywhere
+  // None of these are persisted anywhere
   for (const v of store.values()) assert.ok(!v.includes('docks') && !v.includes('1 Main St'));
   const s2 = A.createState();
-  assert.equal(s2.mode, 'auto');
+  assert.equal(A.cardMode(s2, s2.favorites[0].id), 'auto');
+  assert.deepEqual([...s2.expanded], [s2.favorites[0].id]);
   assert.equal(s2.override, null);
 });
 
