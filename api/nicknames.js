@@ -1,16 +1,17 @@
 /* Josh's Bikes — station nicknames shared across browsers.
  *
- *   GET  /api/nicknames                                  -> { nicknames: { station_id: "My name" } }
- *   POST /api/nicknames  { set: {id: name}, clear: [id] } -> same shape, after applying the changes
+ *   GET  /api/nicknames -> { nicknames: { station_id: "My name" }, hidden: { station_id: "<ms when hidden>" } }
+ *   POST /api/nicknames { set: {id: name}, clear: [id], hide: {id: ms}, unhide: [id] } -> same, after the changes
  *
- * Stored in one Upstash Redis hash (one field per station, so changes to different
- * stations never overwrite each other). Talks to Upstash's REST API with fetch,
+ * Stored in two Upstash Redis hashes, names and hidden stations (one field per
+ * station, so changes to different stations never overwrite each other). Talks to Upstash's REST API with fetch,
  * so there are no dependencies. No login: this is a single-user app, and the
  * input checks below limit what a stranger who found the URL could do.
  */
 'use strict';
 
 const KEY = 'jb:nicknames';
+const HIDDEN_KEY = 'jb:hidden';
 const MAX_NAME = 48;          // same as the rename field's maxlength
 const MAX_CHANGES = 100;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -22,7 +23,7 @@ function cleanName(v) {
   return String(v).replace(/[\u0000-\u001f\u007f]/g, '').trim();
 }
 
-/** Request body -> { set: {id: name}, clear: [id] }. Throws BadRequest on anything unexpected. */
+/** Request body -> { set: {id: name}, clear: [id], hide: {id: ms}, unhide: [id] }. Throws BadRequest on anything unexpected. */
 function validateChanges(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BadRequest('Expected a JSON object.');
   const rawSet = body.set == null ? {} : body.set;
@@ -42,8 +43,25 @@ function validateChanges(body) {
     if (typeof id !== 'string' || !ID_RE.test(id)) throw new BadRequest('Bad station id.');
     if (!(id in set) && !clear.includes(id)) clear.push(id);
   }
-  if (Object.keys(set).length + clear.length > MAX_CHANGES) throw new BadRequest('Too many changes at once.');
-  return { set, clear };
+  const rawHide = body.hide == null ? {} : body.hide;
+  const rawUnhide = body.unhide == null ? [] : body.unhide;
+  if (typeof rawHide !== 'object' || Array.isArray(rawHide)) throw new BadRequest('"hide" must be an object.');
+  if (!Array.isArray(rawUnhide)) throw new BadRequest('"unhide" must be an array.');
+  const hide = {};
+  const unhide = [];
+  for (const [id, v] of Object.entries(rawHide)) {
+    if (!ID_RE.test(id)) throw new BadRequest('Bad station id.');
+    const t = String(v);
+    if (!/^\d{1,15}$/.test(t)) throw new BadRequest('Hidden times are milliseconds.');
+    hide[id] = t;
+  }
+  for (const id of rawUnhide) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw new BadRequest('Bad station id.');
+    if (!(id in hide) && !unhide.includes(id)) unhide.push(id);
+  }
+  const n = Object.keys(set).length + clear.length + Object.keys(hide).length + unhide.length;
+  if (n > MAX_CHANGES) throw new BadRequest('Too many changes at once.');
+  return { set, clear, hide, unhide };
 }
 
 /** Redis HGETALL reply ([field, value, ...]) -> object. */
@@ -100,18 +118,21 @@ function send(res, status, obj) {
 async function handler(req, res) {
   try {
     if (req.method === 'GET') {
-      const [all] = await redis([['HGETALL', KEY]]);
-      return send(res, 200, { nicknames: hashToObject(all) });
+      const [names, hidden] = await redis([['HGETALL', KEY], ['HGETALL', HIDDEN_KEY]]);
+      return send(res, 200, { nicknames: hashToObject(names), hidden: hashToObject(hidden) });
     }
     if (req.method === 'POST') {
-      const { set, clear } = validateChanges(await readBody(req));
+      const { set, clear, hide, unhide } = validateChanges(await readBody(req));
       const cmds = [];
       const pairs = Object.entries(set).flat();
       if (pairs.length) cmds.push(['HSET', KEY, ...pairs]);
       if (clear.length) cmds.push(['HDEL', KEY, ...clear]);
-      cmds.push(['HGETALL', KEY]);
-      const results = await redis(cmds);
-      return send(res, 200, { nicknames: hashToObject(results[results.length - 1]) });
+      const hidePairs = Object.entries(hide).flat();
+      if (hidePairs.length) cmds.push(['HSET', HIDDEN_KEY, ...hidePairs]);
+      if (unhide.length) cmds.push(['HDEL', HIDDEN_KEY, ...unhide]);
+      cmds.push(['HGETALL', KEY], ['HGETALL', HIDDEN_KEY]);
+      const [names, hidden] = (await redis(cmds)).slice(-2);
+      return send(res, 200, { nicknames: hashToObject(names), hidden: hashToObject(hidden) });
     }
     res.setHeader('Allow', 'GET, POST');
     return send(res, 405, { error: 'Use GET or POST.' });

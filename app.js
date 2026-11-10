@@ -46,6 +46,8 @@ const STORAGE_KEYS = {
   nicknames: 'jb.nicknames.v1',   // { station_id: "My name" } — local copy of the shared names
   pendingNicknames: 'jb.nicknames.pending.v1', // name changes not yet confirmed by the server
   nicknamesMigrated: 'jb.nicknames.migrated.v1', // this browser's pre-sync names were queued for upload
+  hidden: 'jb.hidden.v1',                 // { station_id: "<ms when hidden>" } — local copy of the shared list
+  pendingHidden: 'jb.hidden.pending.v1',  // hide/unhide changes not yet confirmed by the server
   stationInfo: 'jb.stationInfo.v1',
   lastStatus: 'jb.lastStatus.v1', // last good station_status, shown if a fetch fails
   feeds: 'jb.feeds.v1',
@@ -327,6 +329,12 @@ function closestStations(lat, lon, stations, k = STATIONS_PER_PLACE) {
     .map((x) => x.s);
 }
 
+/** Stations minus the hidden ones, so a place still shows its nearest five that aren't hidden. */
+function visibleStations(stations, hidden) {
+  if (!hidden || !Object.keys(hidden).length) return stations;
+  return stations.filter((s) => !hidden[s.id]);
+}
+
 /** Auto rule: within 0.5 mi (inclusive) of MY location -> bikes, else docks. */
 function rowMode(toggle, station, me) {
   if (toggle === 'bikes' || toggle === 'docks') return toggle;
@@ -411,8 +419,8 @@ function loadNicknames() {
  * browser keeps a copy (instant and offline) plus "pending": changes it hasn't
  * had confirmed yet, as { id: "name" } or { id: null } for back-to-official.
  */
-function loadPendingNicknames() {
-  const saved = loadJSON(STORAGE_KEYS.pendingNicknames, {});
+function loadPendingNicknames(key = STORAGE_KEYS.pendingNicknames) {
+  const saved = loadJSON(key, {});
   const out = {};
   if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
     for (const [k, v] of Object.entries(saved)) {
@@ -501,6 +509,11 @@ function createState({ wide = false } = {}) {
     recents: loadRecents(),
     nicknames: loadNicknames(),
     pendingNicknames: loadPendingNicknames(),
+    // Hidden stations sync the same way as names: { id: "<ms>" }, pending { id: "<ms>" | null }.
+    hidden: cleanNicknames(loadJSON(STORAGE_KEYS.hidden, {})),
+    pendingHidden: loadPendingNicknames(STORAGE_KEYS.pendingHidden),
+    showHidden: false,            // the "Hidden stations" page is open — memory only
+    toast: null,                  // { text, undo } shown after hiding a station
     modes: new Map(),             // card key -> 'auto' | 'bikes' | 'docks' (missing = auto) — memory only
     expanded: initialExpanded(favorites, wide), // memory only
     gps: { status: 'pending', lat: null, lon: null }, // 'pending' | 'ok' | 'unavailable'
@@ -581,6 +594,8 @@ function bootApp() {
     suggest: $('#suggest'),
     cards: $('#cards'),
     editBtn: $('#editBtn'),
+    hiddenBtn: $('#hiddenBtn'),
+    toast: $('#toast'),
     ptr: $('#ptr'),
   };
 
@@ -666,7 +681,20 @@ function bootApp() {
     syncNicknames();
   }
 
-  /** Send pending changes (or just fetch), then adopt the server's names. Failures keep the changes for next time. */
+  /** Hide (ms string) or un-hide (null) stations here right away, then share it. */
+  function changeHidden(changes) {
+    if (!Object.keys(changes).length) return;
+    state.hidden = mergeNicknames(state.hidden, changes);
+    saveJSON(STORAGE_KEYS.hidden, state.hidden);
+    state.pendingHidden = { ...state.pendingHidden, ...changes };
+    saveJSON(STORAGE_KEYS.pendingHidden, state.pendingHidden);
+    syncNicknames();
+  }
+
+  /**
+   * Send pending changes (names and hidden stations), or just fetch, then adopt the
+   * server's lists. Failures keep the changes for next time.
+   */
   function syncNicknames() {
     if (nameSync) { nameSyncAgain = true; return nameSync; }
     nameSync = (async () => {
@@ -674,8 +702,14 @@ function bootApp() {
         do {
           nameSyncAgain = false;
           const sent = { ...state.pendingNicknames };
-          const init = Object.keys(sent).length
-            ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nicknameRequest(sent)) }
+          const sentHidden = { ...state.pendingHidden };
+          const names = nicknameRequest(sent);
+          const hid = nicknameRequest(sentHidden);
+          const init = Object.keys(sent).length || Object.keys(sentHidden).length
+            ? {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ set: names.set, clear: names.clear, hide: hid.set, unhide: hid.clear }),
+            }
             : {};
           const res = await fetch(NICKNAMES_API, { ...init, cache: 'no-store' });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -683,12 +717,22 @@ function bootApp() {
           if (!json || typeof json.nicknames !== 'object') throw new Error('unexpected response');
           state.pendingNicknames = remainingPending(state.pendingNicknames, sent);
           saveJSON(STORAGE_KEYS.pendingNicknames, state.pendingNicknames);
+          state.pendingHidden = remainingPending(state.pendingHidden, sentHidden);
+          saveJSON(STORAGE_KEYS.pendingHidden, state.pendingHidden);
           const merged = mergeNicknames(cleanNicknames(json.nicknames), state.pendingNicknames);
+          const mergedHidden = mergeNicknames(cleanNicknames(json.hidden), state.pendingHidden);
+          let changed = false;
           if (!sameNicknames(merged, state.nicknames)) {
             state.nicknames = merged;
             saveJSON(STORAGE_KEYS.nicknames, merged);
-            render(); // skips the cards while renaming or editing; they redraw when that ends
+            changed = true;
           }
+          if (!sameNicknames(mergedHidden, state.hidden)) {
+            state.hidden = mergedHidden;
+            saveJSON(STORAGE_KEYS.hidden, mergedHidden);
+            changed = true;
+          }
+          if (changed) render(); // skips the cards while renaming or editing; they redraw when that ends
         } while (nameSyncAgain);
       } catch (e) {
         console.warn('Name sync failed (will retry):', e);
@@ -785,8 +829,9 @@ function bootApp() {
 
     const all = state.favorites.length > 0 && state.favorites.every((f) => state.expanded.has(f.id));
     els.allBtn.textContent = all ? 'Collapse all' : 'Expand all';
-    els.allBtn.hidden = state.editing;
-    document.body.classList.toggle('is-editing', state.editing);
+    els.allBtn.hidden = state.editing || state.showHidden;
+    // Edit mode and the Hidden stations page both hide the search box and the color key.
+    document.body.classList.toggle('is-editing', state.editing || state.showHidden);
   }
 
   function renderLocation() {
@@ -870,9 +915,85 @@ function bootApp() {
       type: 'button', class: 'edit-name', icon: 'pencil', 'aria-label': `Rename ${nameText}`,
       onclick: (e) => { e.preventDefault(); if (!state.renaming && !state.editing) rename(true); },
     });
-    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, pencil, right);
+    // Trash beside the pencil: hide this station everywhere (Undo in the toast; restore from Hidden stations).
+    const trash = h('button', {
+      type: 'button', class: 'edit-name hide-st', icon: 'trash', 'aria-label': `Hide ${nameText}`,
+      onclick: (e) => { e.preventDefault(); if (!state.renaming && !state.editing) hideStation(station, nameText); },
+    });
+    const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, pencil, trash, right);
     onLongPress(row, () => rename(false));
     return row;
+  }
+
+  /* ---------------- Hiding stations ---------------- */
+  let toastTimer = null;
+  function showToast(text, undo) {
+    clearTimeout(toastTimer);
+    const t = els.toast;
+    t.replaceChildren(h('span', { class: 'toast-text', text }),
+      undo ? h('button', { type: 'button', class: 'toast-btn', onclick: () => { hideToast(); undo(); } }, 'Undo') : null);
+    t.hidden = false;
+    toastTimer = setTimeout(hideToast, 8000);
+  }
+  function hideToast() { clearTimeout(toastTimer); els.toast.hidden = true; }
+
+  function hideStation(station, label) {
+    changeHidden({ [station.id]: String(Date.now()) });
+    render();
+    showToast(`Hid ${label}`, () => { changeHidden({ [station.id]: null }); render(); });
+  }
+
+  function restoreStation(id) {
+    changeHidden({ [id]: null });
+    render();
+  }
+
+  /** The "Hidden stations" page: everything hidden, newest first, each with Restore. */
+  function hiddenPage() {
+    const ids = Object.keys(state.hidden).sort((a, b) => Number(state.hidden[b]) - Number(state.hidden[a]));
+    const byId = new Map(state.stations.map((s) => [s.id, s]));
+    const near = (s) => {
+      let best = null;
+      for (const f of state.favorites) {
+        const d = haversineMi(f.lat, f.lon, s.lat, s.lon);
+        if (!best || d < best.d) best = { f, d };
+      }
+      return best ? `${formatMiles(best.d)} from ${best.f.label}` : '';
+    };
+    const when = (ms) => {
+      const d = new Date(Number(ms));
+      return Number.isFinite(d.getTime()) ? `Hidden ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : '';
+    };
+    const rows = ids.map((id) => {
+      const s = byId.get(id);
+      const name = s ? displayName(s, state.nicknames) : 'Station no longer listed by Citi Bike';
+      const sub = [s && state.nicknames[id] ? s.name : null, s ? near(s) : null, when(state.hidden[id])].filter(Boolean).join(' · ');
+      return h('li', { class: 'hid-row' },
+        h('span', { class: 'hid-text' },
+          h('span', { class: 'hid-name', text: name }),
+          sub ? h('span', { class: 'hid-sub', text: sub }) : null),
+        h('button', { type: 'button', class: 'btn secondary small', onclick: () => restoreStation(id) }, 'Restore'));
+    });
+    return h('section', { class: 'card open hidden-page', 'aria-label': 'Hidden stations' },
+      h('div', { class: 'card-head' },
+        h('div', { class: 'lookup-title' },
+          h('span', { class: 'card-name', text: 'Hidden stations' }),
+          h('span', { class: 'card-sub', text: ids.length ? 'Restore one to show it again.' : 'Nothing is hidden.' })),
+        h('button', { type: 'button', class: 'btn small', onclick: closeHiddenPage }, 'Done')),
+      ids.length ? h('ul', { class: 'rows' }, rows) : null);
+  }
+
+  function openHiddenPage() {
+    mainSearch.close();
+    hideToast();
+    state.showHidden = true;
+    render();
+    window.scrollTo({ top: 0 });
+  }
+  function closeHiddenPage() {
+    state.showHidden = false;
+    render();
+    window.scrollTo({ top: 0 });
   }
 
   function modeControl(key) {
@@ -888,7 +1009,7 @@ function bootApp() {
 
   function stationList(lat, lon) {
     if (!state.stations.length) return null;
-    return closestStations(lat, lon, state.stations);
+    return closestStations(lat, lon, visibleStations(state.stations, state.hidden));
   }
 
   function favoriteCard(f, me) {
@@ -904,20 +1025,29 @@ function bootApp() {
         render();
       },
     }, icon('chevron', 'ic chev'), nameEl);
-    if (!open && stations && state.status.size) {
-      toggle.append(h('span', { class: 'minis' },
-        stations.map((s) => miniTile(state.status.get(s.id), rowMode(mode, s, me)))));
-    }
-    onLongPress(toggle, () => startRename(toggle, {
-      title: 'Rename place', value: f.label, placeholder: f.label, note: f.address,
+    const rename = (focusNow) => startRename(toggle, {
+      title: 'Rename place', value: f.label, placeholder: f.label, note: f.address, focusNow,
       onCommit: (v) => {
         if (!v) return;
         f.label = v;
         saveJSON(STORAGE_KEYS.favorites, state.favorites);
         if (state.override && state.override.kind === 'favorite' && state.override.id === f.id) state.override.label = v;
       },
-    }));
-    const head = h('div', { class: 'card-head' }, toggle, open ? modeControl(f.id) : null);
+    });
+    onLongPress(toggle, () => rename(false));
+    // Pencil right after the name (a sibling of the toggle: a button can't hold another button).
+    const pencil = h('button', {
+      type: 'button', class: 'edit-name', icon: 'pencil', 'aria-label': `Rename ${f.label}`,
+      onclick: () => { if (!state.renaming && !state.editing) rename(true); },
+    });
+    const minis = !open && stations && state.status.size
+      ? h('span', { class: 'minis' }, stations.map((s) => miniTile(state.status.get(s.id), rowMode(mode, s, me))))
+      : null;
+    const head = h('div', {
+      class: 'card-head',
+      // The space beside the name (and the mini tiles) still opens and closes the card.
+      onclick: (e) => { if (!e.target.closest('button, .modes, .rename-block')) toggle.click(); },
+    }, toggle, pencil, minis, open ? modeControl(f.id) : null);
     const card = h('section', { class: `card${open ? ' open' : ''}`, 'data-id': f.id }, head);
     if (open) {
       if (!stations) card.append(h('p', { class: 'empty', text: state.loading ? 'Loading stations…' : "Couldn't load stations." }));
@@ -961,8 +1091,15 @@ function bootApp() {
   }
 
   function renderCards() {
-    els.editBtn.hidden = false;
     els.cards.classList.remove('editing');
+    const nHidden = Object.keys(state.hidden).length;
+    els.hiddenBtn.textContent = `Hidden stations (${nHidden})`;
+    els.hiddenBtn.hidden = !nHidden || state.showHidden;
+    els.editBtn.hidden = state.showHidden;
+    if (state.showHidden) {
+      els.cards.replaceChildren(hiddenPage());
+      return;
+    }
     const me = myLocation(state);
     const cards = [];
     if (state.lookup) cards.push(lookupCard(me));
@@ -1153,7 +1290,7 @@ function bootApp() {
     const cancel = () => { clearTimeout(timer); timer = null; };
     el.addEventListener('pointerdown', (e) => {
       if (state.editing || state.renaming || (e.pointerType === 'mouse' && e.button !== 0)) return;
-      if (e.target.closest('input, .modes, .edit-name')) return;
+      if (e.target.closest('input, .modes, .edit-name, .toast')) return;
       sx = e.clientX; sy = e.clientY;
       cancel();
       timer = setTimeout(() => {
@@ -1234,10 +1371,13 @@ function bootApp() {
     mainSearch.close();
     state.editing = true;
     state.draft = state.favorites.map((f) => ({ ...f, origAddress: f.address, error: '', names: {} }));
+    hideToast();
     renderEditor();
   });
+  els.hiddenBtn.addEventListener('click', openHiddenPage);
 
   function renderEditor() {
+    els.hiddenBtn.hidden = true;
     els.editBtn.hidden = true;
     renderStatus();
     els.cards.classList.add('editing');
@@ -1298,7 +1438,8 @@ function bootApp() {
       ontoggle: () => { f.namesOpen = namesBox.open; },
     }, h('summary', null, icon('pencil'), 'Rename stations', namesCount), namesList);
     const renderStationNames = () => {
-      const stations = Number.isFinite(f.lat) && state.stations.length ? closestStations(f.lat, f.lon, state.stations) : [];
+      const stations = Number.isFinite(f.lat) && state.stations.length
+        ? closestStations(f.lat, f.lon, visibleStations(state.stations, state.hidden)) : [];
       namesBox.hidden = !stations.length;
       const renamed = stations.filter((s) => (f.names[s.id] != null ? f.names[s.id].trim() : state.nicknames[s.id])).length;
       namesCount.textContent = renamed ? `${renamed} renamed` : '';
@@ -1589,7 +1730,7 @@ if (typeof module !== 'undefined' && module.exports) {
     parseStationInfo, parseStationStatus, parseVehicleTypes, feedsFromDiscovery,
     parsePhoton, parseGeoSearch, prettyStreet, categoryLabel, sortBranches,
     addRecent, setNickname, displayName, initialExpanded, cardMode,
-    cleanNicknames, loadPendingNicknames, mergeNicknames, remainingPending, nicknameRequest, nicknameChanges,
+    cleanNicknames, loadPendingNicknames, mergeNicknames, remainingPending, nicknameRequest, nicknameChanges, visibleStations,
     createState, myLocation, formatUpdated, loadFavorites, loadRecents, loadNicknames, homeCoords,
   };
 }

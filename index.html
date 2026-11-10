@@ -60,7 +60,10 @@
     <div id="cards" class="cards"></div>
 
     <div class="foot">
-      <button type="button" id="editBtn" class="text-btn">Edit favorites</button>
+      <div class="foot-btns">
+        <button type="button" id="editBtn" class="text-btn">Edit</button>
+        <button type="button" id="hiddenBtn" class="text-btn" hidden>Hidden stations</button>
+      </div>
       <div class="key" role="group" aria-label="Color key">
         <span class="key-item"><span class="key-sw c-good" aria-hidden="true"></span>5+</span>
         <span class="key-item"><span class="key-sw c-low" aria-hidden="true"></span>1–4</span>
@@ -69,10 +72,12 @@
       <p class="legend" aria-hidden="true">
         <span class="lg"><span class="mini bikes c-good">7</span> bikes</span>
         <span class="lg"><span class="mini docks c-good">7</span> docks</span>
-        <span class="lg">Tap a station for the map · hold a name to rename it</span>
+        <span class="lg">Tap a station for the map</span>
       </p>
     </div>
   </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
   <noscript><p class="fail-line">Josh's Bikes needs JavaScript.</p></noscript>
 </body>

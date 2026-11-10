@@ -293,13 +293,24 @@ test('favorites: more than five load; past the limit falls back to defaults', ()
   localStorage.removeItem(A.STORAGE_KEYS.favorites);
 });
 
+test('hidden stations: a place shows its nearest five that are not hidden', () => {
+  const stations = [];
+  for (let i = 0; i < 10; i++) stations.push({ id: 's' + i, name: 'S' + i, lat: 40.7 + i * 0.001, lon: -74 });
+  const near = (hidden) => A.closestStations(40.7, -74, A.visibleStations(stations, hidden)).map((s) => s.id);
+  assert.deepEqual(near({}), ['s0', 's1', 's2', 's3', 's4']);
+  assert.deepEqual(near({ s1: '1', s3: '2' }), ['s0', 's2', 's4', 's5', 's6']);
+  assert.equal(A.visibleStations(stations, {}), stations); // nothing hidden: same list, no copy
+});
+
 const api = require('../api/nicknames.js');
 
 test('api: validateChanges accepts good input and normalizes it', () => {
   assert.deepEqual(api.validateChanges({ set: { '2124037250266884686': '  Corner ' }, clear: ['abc-1'] }),
-    { set: { '2124037250266884686': 'Corner' }, clear: ['abc-1'] });
-  assert.deepEqual(api.validateChanges({ set: { a: '   ' } }), { set: {}, clear: ['a'] }); // blank = clear
-  assert.deepEqual(api.validateChanges({}), { set: {}, clear: [] });
+    { set: { '2124037250266884686': 'Corner' }, clear: ['abc-1'], hide: {}, unhide: [] });
+  assert.deepEqual(api.validateChanges({ set: { a: '   ' } }), { set: {}, clear: ['a'], hide: {}, unhide: [] }); // blank = clear
+  assert.deepEqual(api.validateChanges({}), { set: {}, clear: [], hide: {}, unhide: [] });
+  assert.deepEqual(api.validateChanges({ hide: { s1: '1794344142000' }, unhide: ['s2', 's1'] }),
+    { set: {}, clear: [], hide: { s1: '1794344142000' }, unhide: ['s2'] }); // hide wins over unhide for the same id
 });
 
 test('api: validateChanges rejects bad input', () => {
@@ -309,21 +320,24 @@ test('api: validateChanges rejects bad input', () => {
   bad({ clear: [5] }); bad({ clear: ['../x'] });
   const many = {}; for (let i = 0; i < 101; i++) many['s' + i] = 'n';
   bad({ set: many });
+  bad({ hide: [] }); bad({ unhide: {} }); bad({ hide: { s1: 'yesterday' } }); bad({ hide: { 'a b': '1' } }); bad({ unhide: [3] });
 });
 
 (async () => {
   // Handler against a fake Upstash REST endpoint.
-  const hash = new Map();
+  const hashes = new Map(); // key -> Map(field -> value)
+  const hash = (k) => { if (!hashes.has(k)) hashes.set(k, new Map()); return hashes.get(k); };
   process.env.KV_REST_API_URL = 'https://fake-redis.test/';
   process.env.KV_REST_API_TOKEN = 'test-token';
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     assert.equal(url, 'https://fake-redis.test/multi-exec');
     assert.equal(opts.headers.Authorization, 'Bearer test-token');
-    const out = JSON.parse(opts.body).map(([cmd, , ...args]) => {
-      if (cmd === 'HSET') { for (let i = 0; i < args.length; i += 2) hash.set(args[i], args[i + 1]); return { result: args.length / 2 }; }
-      if (cmd === 'HDEL') { args.forEach((f) => hash.delete(f)); return { result: args.length }; }
-      if (cmd === 'HGETALL') return { result: [...hash].flat() };
+    const out = JSON.parse(opts.body).map(([cmd, key, ...args]) => {
+      const m = hash(key);
+      if (cmd === 'HSET') { for (let i = 0; i < args.length; i += 2) m.set(args[i], args[i + 1]); return { result: args.length / 2 }; }
+      if (cmd === 'HDEL') { args.forEach((f) => m.delete(f)); return { result: args.length }; }
+      if (cmd === 'HGETALL') return { result: [...m].flat() };
       return { error: 'unknown' };
     });
     return { ok: true, status: 200, json: async () => out };
@@ -335,11 +349,15 @@ test('api: validateChanges rejects bad input', () => {
   };
   let r = await call('POST', { set: { s1: 'Home corner', s2: 'Gym' } });
   assert.equal(r.statusCode, 200);
-  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner', s2: 'Gym' } });
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner', s2: 'Gym' }, hidden: {} });
   r = await call('POST', JSON.stringify({ clear: ['s2'] })); // string bodies work too
-  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' } });
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' }, hidden: {} });
+  r = await call('POST', { hide: { s3: '100', s4: '200' } });
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' }, hidden: { s3: '100', s4: '200' } });
+  r = await call('POST', { unhide: ['s3'], set: { s4: 'Hidden one' } });
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner', s4: 'Hidden one' }, hidden: { s4: '200' } });
   r = await call('GET');
-  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' } });
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner', s4: 'Hidden one' }, hidden: { s4: '200' } });
   assert.equal(r.headers['Cache-Control'], 'no-store');
   assert.equal((await call('POST', { set: { s1: 7 } })).statusCode, 400);
   assert.equal((await call('POST', '{oops')).statusCode, 400);

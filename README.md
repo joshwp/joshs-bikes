@@ -9,12 +9,14 @@ Plain HTML/CSS/JS, no build step; one small Vercel Function for shared station n
 - **Reading a tile:** solid = bikes to take (⚡ e-bikes large, classic small); dashed = docks to fill.
   Green 5+, yellow 1–4, red 0 (the key at the bottom of the page).
 - **Favorites:** start with five, up to ten. "Save as favorite" on a search adds one (or replaces one when full);
-  Edit favorites adds, removes, reorders and replaces.
-- **Renaming:** tap the ✎ beside a station name (or hold any place or station name) to rename it right in
+  Edit adds, removes, reorders and replaces.
+- **Renaming:** tap the ✎ beside any place or station name (or hold the name) to rename it right in
   the row (Save, Cancel, Use official name).
   Renamed stations show their official name underneath.
+- **Hiding stations:** tap the trash can beside a station to hide it everywhere (Undo in the toast);
+  the place then shows its next-nearest station. "Hidden stations" at the bottom restores them.
 - **Map:** tap a station name to open it in Google Maps (the Maps app on Android).
-- **Shared names:** station nicknames sync across browsers through `api/nicknames.js`, a Vercel Function
+- **Shared names:** station nicknames and hidden stations sync across browsers through `api/nicknames.js`, a Vercel Function
   backed by an Upstash Redis store (`joshs-bikes-names`, free plan, via the Vercel Marketplace).
   Each browser keeps a local copy and queues offline changes. No login — single user.
 

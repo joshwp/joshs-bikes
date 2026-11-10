@@ -194,8 +194,11 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
 .card { background: var(--card); border-radius: 18px; box-shadow: var(--shadow); overflow: hidden; }
 .card.lookup { box-shadow: 0 0 0 2px #bfdbfe, var(--shadow); }
 .card-head { display: flex; align-items: center; gap: 4px; padding: 4px 6px 4px 4px; min-height: 60px; }
+.card-head:has(.card-toggle) { cursor: pointer; }
+.card-head .edit-name { margin-left: -8px; }
+.card-head .minis, .card-head .card-toggle ~ .modes { margin-left: auto; }
 .card-toggle {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   min-height: 52px;
   display: flex;
@@ -306,6 +309,44 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
 }
 .edit-name svg { width: 100%; height: 100%; display: block; }
 .edit-name:hover, .edit-name:active { color: var(--accent); background: #eff6ff; }
+.row .edit-name + .edit-name { margin-left: -14px; } /* pencil and trash sit together */
+.hide-st:hover, .hide-st:active { color: var(--none-text); background: #fef2f2; }
+
+/* Undo toast after hiding a station */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 16px);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: calc(100% - 32px);
+  padding: 6px 6px 6px 16px;
+  border-radius: 14px;
+  background: var(--text);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, .25);
+  transform: translateX(-50%);
+}
+.toast-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast-btn { flex: none; min-height: 40px; padding: 0 14px; border: 0; border-radius: 10px; background: rgba(255, 255, 255, .14); color: #93c5fd; font-weight: 750; }
+
+/* Hidden stations page */
+.cards:has(.hidden-page) { grid-template-columns: minmax(0, 1fr); max-width: 640px; margin: 0 auto; }
+.hid-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 60px;
+  padding: 8px 12px 8px 16px;
+  border-top: 1px solid var(--line);
+}
+.hid-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.hid-name { font-size: 15px; color: #1e293b; }
+.hid-sub { font-size: 12px; color: var(--text-3); }
 /* A renamed station: official name underneath, small. */
 .official { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -430,6 +471,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
 
 /* ---------- Footer ---------- */
 .foot { text-align: center; padding: 18px 0 8px; }
+.foot-btns { display: flex; justify-content: center; flex-wrap: wrap; gap: 4px 12px; }
 /* Color key: one swatch per band, in the bike fill with the dock outline, so it reads for both tiles. */
 .key { display: flex; justify-content: center; gap: 18px; margin: 10px 0 0; font-size: 14px; font-weight: 750; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .key-item { display: inline-flex; align-items: center; gap: 6px; }
