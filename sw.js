@@ -1,8 +1,9 @@
 /* Josh's Bikes service worker: caches the app shell only.
  * Shell files are network-first (so deploys show up right away) with the cache
  * as an offline fallback. Station and geocoding data are cross-origin and are
- * never intercepted, so they always come straight from the network. */
-const CACHE = 'jb-shell-v2';
+ * never intercepted, and neither is /api/ (shared station names), so they
+ * always come straight from the network. */
+const CACHE = 'jb-shell-v3';
 const SHELL = [
   '/',
   '/index.html',
@@ -29,6 +30,7 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
   if (req.method !== 'GET' || url.origin !== self.location.origin) return; // data: network only
+  if (url.pathname.startsWith('/api/')) return; // shared names: always live, never cached
 
   event.respondWith(
     fetch(req)

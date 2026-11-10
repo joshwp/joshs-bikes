@@ -268,7 +268,9 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
   min-width: 0;
   align-self: stretch;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
   margin: -6px 0;
   padding: 6px 0;
   border-radius: 8px;
@@ -290,6 +292,8 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
   overflow: hidden;
 }
 .row.off .name { color: var(--faint); }
+/* A renamed station: official name underneath, small. */
+.official { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- Availability tiles ---------- */
 .tile {
@@ -376,22 +380,50 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
 .picker { padding: 8px 14px 14px; border-top: 1px solid var(--line); }
 .picker-title { margin: 0 0 8px; font-size: 14px; font-weight: 650; color: var(--text-2); }
 
-/* Inline rename */
-.rename-block { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; padding: 4px 6px; }
+/* Inline rename panel (opens on hold, takes the whole row) */
+.is-renaming > :not(.rename-block) { display: none !important; }
+.rename-block {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0;
+  padding: 10px 12px 8px;
+  border-radius: 14px;
+  background: #eff6ff;
+  box-shadow: inset 0 0 0 1.5px #bfdbfe;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.card-head > .rename-block { margin: 2px; }
+.rename-title { font-size: 12px; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; color: var(--accent); }
 .rename {
   width: 100%;
-  min-height: 44px;
-  padding: 0 10px;
+  min-height: 46px;
+  padding: 0 12px;
   border: 2px solid var(--accent);
   border-radius: 10px;
   background: #fff;
   font-size: 16px;
   font-weight: 650;
 }
-.rename-hint { font-size: 12px; color: var(--text-3); }
+.rename:focus { outline: none; box-shadow: 0 0 0 3px rgba(29, 78, 216, .18); }
+.rename-note { font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
+.rename-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rename-actions .spacer { flex: 1; }
+.rename-actions .reset { padding: 0 4px; }
 
 /* ---------- Footer ---------- */
 .foot { text-align: center; padding: 18px 0 8px; }
+/* Color key: one swatch per band, in the bike fill with the dock outline, so it reads for both tiles. */
+.key { display: flex; justify-content: center; gap: 18px; margin: 10px 0 0; font-size: 14px; font-weight: 750; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.key-item { display: inline-flex; align-items: center; gap: 6px; }
+.key-sw { width: 18px; height: 18px; border-radius: 5px; border: 2px solid; }
+.key-sw.c-good { background: var(--good-fill); border-color: var(--good-line); }
+.key-sw.c-low { background: var(--low-fill); border-color: var(--low-line); }
+.key-sw.c-none { background: var(--none-fill); border-color: var(--none-line); }
+.is-editing .key { display: none; }
 .legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 16px; margin: 6px 0 0; font-size: 12px; color: var(--text-3); }
 .lg { display: inline-flex; align-items: center; gap: 6px; }
 .lg .mini { min-width: 24px; height: 20px; font-size: 11px; }
@@ -437,7 +469,29 @@ main { max-width: 1240px; margin: 0 auto; padding: 4px 12px calc(env(safe-area-i
 .edit-fields .lbl { font-weight: 750; }
 .edit-fields .st-name { font-size: 15px; }
 .edit-stations { display: flex; flex-direction: column; gap: 6px; }
-.edit-names summary { min-height: 44px; display: flex; align-items: center; font-size: 14px; font-weight: 650; color: var(--accent); cursor: pointer; }
+.edit-names summary { min-height: 44px; display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 650; color: var(--accent); cursor: pointer; }
+.edit-names summary .ic { width: 16px; height: 16px; }
+.names-count { margin-left: auto; padding: 2px 8px; border-radius: 10px; background: #eff6ff; font-size: 12px; font-weight: 700; }
+.names-count:empty { display: none; }
+.edit-row .remove { color: var(--text-3); }
+.edit-row .remove:disabled { opacity: .35; cursor: default; }
+.add-fav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 52px;
+  margin: 0 0 12px;
+  border: 2px dashed var(--field);
+  border-radius: 18px;
+  background: none;
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 700;
+}
+.add-fav .ic { width: 18px; height: 18px; }
+.hint.center { text-align: center; }
 .st-field { display: flex; flex-direction: column; gap: 2px; }
 .st-official { font-size: 12px; color: var(--text-3); padding-left: 2px; }
 .card-err { color: #b91c1c; font-size: 13px; margin: 0; }

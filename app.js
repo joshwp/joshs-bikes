@@ -20,10 +20,11 @@ const DEFAULT_FEEDS = {
 const GEOSEARCH_URL = 'https://geosearch.planninglabs.nyc/v2';   // NYC addresses (no key)
 const PHOTON_URL = 'https://photon.komoot.io/api/';               // OpenStreetMap places (no key)
 const NYC_BBOX = '-74.27,40.48,-73.68,40.93';                     // minLon,minLat,maxLon,maxLat
+const NICKNAMES_API = '/api/nicknames';                           // shared station names (api/nicknames.js)
 
 const AUTO_RADIUS_MI = 0.5;
 const STATIONS_PER_PLACE = 5;
-const MAX_FAVORITES = 5;
+const MAX_FAVORITES = 10;            // the app starts with 5; Edit favorites or search can add more
 const MAX_RECENTS = 3;
 const EARTH_RADIUS_MI = 3958.7613;
 const WIDE_QUERY = '(min-width: 760px)'; // desktop/tablet: grid layout, everything expanded
@@ -42,7 +43,9 @@ const HOME_ID = 'home';
 const STORAGE_KEYS = {
   favorites: 'jb.favorites.v1',
   recents: 'jb.recents.v1',
-  nicknames: 'jb.nicknames.v1',   // { station_id: "My name" }
+  nicknames: 'jb.nicknames.v1',   // { station_id: "My name" } — local copy of the shared names
+  pendingNicknames: 'jb.nicknames.pending.v1', // name changes not yet confirmed by the server
+  nicknamesMigrated: 'jb.nicknames.migrated.v1', // this browser's pre-sync names were queued for upload
   stationInfo: 'jb.stationInfo.v1',
   lastStatus: 'jb.lastStatus.v1', // last good station_status, shown if a fetch fails
   feeds: 'jb.feeds.v1',
@@ -390,13 +393,67 @@ function loadRecents() {
     .slice(0, MAX_RECENTS);
 }
 
-function loadNicknames() {
-  const saved = loadJSON(STORAGE_KEYS.nicknames, {});
+/** Any object -> { id: "non-empty trimmed name" } (drops everything else). */
+function cleanNicknames(obj) {
   const out = {};
-  if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
-    for (const [k, v] of Object.entries(saved)) if (typeof v === 'string' && v.trim()) out[k] = v.trim();
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    for (const [k, v] of Object.entries(obj)) if (typeof v === 'string' && v.trim()) out[k] = v.trim();
   }
   return out;
+}
+
+function loadNicknames() {
+  return cleanNicknames(loadJSON(STORAGE_KEYS.nicknames, {}));
+}
+
+/*
+ * Name sync. The server (/api/nicknames) holds the names for every browser; this
+ * browser keeps a copy (instant and offline) plus "pending": changes it hasn't
+ * had confirmed yet, as { id: "name" } or { id: null } for back-to-official.
+ */
+function loadPendingNicknames() {
+  const saved = loadJSON(STORAGE_KEYS.pendingNicknames, {});
+  const out = {};
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === null) out[k] = null;
+      else if (typeof v === 'string') out[k] = v.trim() || null;
+    }
+  }
+  return out;
+}
+
+/** The server's names with this browser's unconfirmed changes on top. */
+function mergeNicknames(server, pending) {
+  const out = { ...server };
+  for (const [id, v] of Object.entries(pending || {})) { if (v) out[id] = v; else delete out[id]; }
+  return out;
+}
+
+/** What's still pending once the server confirmed `sent` (a name changed again meanwhile stays). */
+function remainingPending(pending, sent) {
+  const out = {};
+  for (const [id, v] of Object.entries(pending)) if (!(id in sent) || sent[id] !== v) out[id] = v;
+  return out;
+}
+
+/** Pending changes -> the POST body { set, clear }. */
+function nicknameRequest(pending) {
+  const set = {}, clear = [];
+  for (const [id, v] of Object.entries(pending)) { if (v) set[id] = v; else clear.push(id); }
+  return { set, clear };
+}
+
+/** Changes from `before` to `after` for the given ids, as pending entries. */
+function nicknameChanges(before, after, ids) {
+  const out = {};
+  for (const id of ids) if ((before[id] || null) !== (after[id] || null)) out[id] = after[id] || null;
+  return out;
+}
+
+function sameNicknames(a, b) {
+  const ka = Object.keys(a), kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k) => a[k] === b[k]);
 }
 
 /** Set (or clear, with an empty name) a station nickname. Returns a new map. */
@@ -443,6 +500,7 @@ function createState({ wide = false } = {}) {
     favorites,
     recents: loadRecents(),
     nicknames: loadNicknames(),
+    pendingNicknames: loadPendingNicknames(),
     modes: new Map(),             // card key -> 'auto' | 'bikes' | 'docks' (missing = auto) — memory only
     expanded: initialExpanded(favorites, wide), // memory only
     gps: { status: 'pending', lat: null, lon: null }, // 'pending' | 'ok' | 'unavailable'
@@ -497,6 +555,9 @@ const ICONS = {
   chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   grip: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
+  pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/></svg>',
 };
 
 function bootApp() {
@@ -583,8 +644,64 @@ function bootApp() {
     saveJSON(STORAGE_KEYS.lastStatus, { savedAt, rows });
   }
 
+  /* ---------------- Shared station names ---------------- */
+  let nameSync = null;      // the sync in flight, if any
+  let nameSyncAgain = false; // a change arrived while syncing: go round once more
+
+  /** Names set in a browser before sync existed get uploaded once (they keep any newer local change). */
+  function migrateLocalNicknames() {
+    if (loadJSON(STORAGE_KEYS.nicknamesMigrated, false)) return;
+    state.pendingNicknames = { ...state.nicknames, ...state.pendingNicknames };
+    saveJSON(STORAGE_KEYS.pendingNicknames, state.pendingNicknames);
+    saveJSON(STORAGE_KEYS.nicknamesMigrated, true);
+  }
+
+  /** Apply name changes ({id: name|null}) here right away, then share them. */
+  function changeNicknames(changes) {
+    if (!Object.keys(changes).length) return;
+    state.nicknames = mergeNicknames(state.nicknames, changes);
+    saveJSON(STORAGE_KEYS.nicknames, state.nicknames);
+    state.pendingNicknames = { ...state.pendingNicknames, ...changes };
+    saveJSON(STORAGE_KEYS.pendingNicknames, state.pendingNicknames);
+    syncNicknames();
+  }
+
+  /** Send pending changes (or just fetch), then adopt the server's names. Failures keep the changes for next time. */
+  function syncNicknames() {
+    if (nameSync) { nameSyncAgain = true; return nameSync; }
+    nameSync = (async () => {
+      try {
+        do {
+          nameSyncAgain = false;
+          const sent = { ...state.pendingNicknames };
+          const init = Object.keys(sent).length
+            ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nicknameRequest(sent)) }
+            : {};
+          const res = await fetch(NICKNAMES_API, { ...init, cache: 'no-store' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const json = await res.json();
+          if (!json || typeof json.nicknames !== 'object') throw new Error('unexpected response');
+          state.pendingNicknames = remainingPending(state.pendingNicknames, sent);
+          saveJSON(STORAGE_KEYS.pendingNicknames, state.pendingNicknames);
+          const merged = mergeNicknames(cleanNicknames(json.nicknames), state.pendingNicknames);
+          if (!sameNicknames(merged, state.nicknames)) {
+            state.nicknames = merged;
+            saveJSON(STORAGE_KEYS.nicknames, merged);
+            render(); // skips the cards while renaming or editing; they redraw when that ends
+          }
+        } while (nameSyncAgain);
+      } catch (e) {
+        console.warn('Name sync failed (will retry):', e);
+      } finally {
+        nameSync = null;
+      }
+    })();
+    return nameSync;
+  }
+
   /** On open: station_information + station_status. On pull-down: status only. */
   async function refresh({ withInfo = false } = {}) {
+    syncNicknames(); // names ride along with every data refresh (open, pull-down, return to the app)
     if (state.loading) return;
     state.loading = true;
     state.lastAttempt = Date.now();
@@ -717,6 +834,7 @@ function bootApp() {
   function stationRow(station, key, me) {
     const st = state.status.get(station.id);
     const nameText = displayName(station, state.nicknames);
+    const custom = !!state.nicknames[station.id];
     // Tap the name: open the station in Google Maps. Hold it: rename (handled on the row below).
     const link = h('a', {
       class: 'name-link', href: mapsUrl(station.lat, station.lon), target: '_blank', rel: 'noopener',
@@ -725,7 +843,10 @@ function bootApp() {
         // A long press that just opened the rename field must not also open the map.
         if (row.dataset.lp) { e.preventDefault(); delete row.dataset.lp; }
       },
-    }, h('span', { class: 'name', text: nameText }));
+    },
+    h('span', { class: 'name', text: nameText }),
+    // A renamed station keeps its official name in view, small, underneath.
+    custom ? h('span', { class: 'official', text: station.name }) : null);
     let right;
     let off = false;
     if (!state.status.size) right = h('span', { class: 'tile pending', text: '…' });
@@ -734,12 +855,14 @@ function bootApp() {
     const row = h('li', { class: `row${off ? ' off' : ''}`, 'data-station': station.id }, link, right);
     // The rename field replaces the whole link, so typing in it can never follow the link.
     onLongPress(row, () => startRename(link, {
+      title: 'Rename station',
       value: state.nicknames[station.id] || '',
       placeholder: station.name,
-      hint: `Official name: ${station.name} · clear to reset`,
+      note: `Official name: ${station.name}`,
+      resetLabel: custom ? 'Use official name' : null,
       onCommit: (v) => {
-        state.nicknames = setNickname(state.nicknames, station.id, v, station.name);
-        saveJSON(STORAGE_KEYS.nicknames, state.nicknames);
+        const next = setNickname(state.nicknames, station.id, v, station.name);
+        changeNicknames(nicknameChanges(state.nicknames, next, [station.id]));
       },
     }));
     return row;
@@ -779,7 +902,7 @@ function bootApp() {
         stations.map((s) => miniTile(state.status.get(s.id), rowMode(mode, s, me)))));
     }
     onLongPress(toggle, () => startRename(toggle, {
-      value: f.label, placeholder: f.label, hint: `${f.address} · Enter to save`,
+      title: 'Rename place', value: f.label, placeholder: f.label, note: f.address,
       onCommit: (v) => {
         if (!v) return;
         f.label = v;
@@ -811,7 +934,7 @@ function bootApp() {
 
     if (state.picking) {
       card.append(h('div', { class: 'picker' },
-        h('p', { class: 'picker-title', text: 'Replace which favorite?' }),
+        h('p', { class: 'picker-title', text: `You have ${MAX_FAVORITES} favorites, the most it holds. Replace which one?` }),
         h('div', { class: 'chips' },
           state.favorites.map((f) => h('button', { type: 'button', class: 'chip', onclick: () => saveLookupAsFavorite(f.id) }, f.label)),
           h('button', { type: 'button', class: 'chip ghost', onclick: () => { state.picking = false; render(); } }, 'Cancel'))));
@@ -819,8 +942,13 @@ function bootApp() {
       card.append(h('div', { class: 'card-actions' },
         h('button', { type: 'button', class: 'text-btn', onclick: () => setOverride({ kind: 'place', label: L.name, lat: L.lat, lon: L.lon }) },
           icon('pin'), 'Set as my location'),
-        h('button', { type: 'button', class: 'text-btn', onclick: () => { state.picking = true; render(); } },
-          '★ Save as favorite')));
+        h('button', {
+          type: 'button', class: 'text-btn',
+          onclick: () => {
+            if (state.favorites.length < MAX_FAVORITES) saveLookupAsFavorite(null); // room: add it
+            else { state.picking = true; render(); }                               // full: pick one to replace
+          },
+        }, '★ Save as favorite')));
     }
     return card;
   }
@@ -987,12 +1115,20 @@ function bootApp() {
     render();
   }
 
+  /** Save the looked-up place as a new favorite (slotId null) or in place of an existing one. */
   function saveLookupAsFavorite(slotId) {
     const L = state.lookup;
-    const i = state.favorites.findIndex((f) => f.id === slotId);
-    if (!L || i < 0) return;
+    if (!L) return;
     const id = newId();
-    state.favorites[i] = { id, label: L.name, address: [L.name, L.sub].filter(Boolean).join(', '), lat: L.lat, lon: L.lon };
+    const fav = { id, label: L.name, address: [L.name, L.sub].filter(Boolean).join(', '), lat: L.lat, lon: L.lon };
+    if (slotId == null) {
+      if (state.favorites.length >= MAX_FAVORITES) return;
+      state.favorites.push(fav);
+    } else {
+      const i = state.favorites.findIndex((f) => f.id === slotId);
+      if (i < 0) return;
+      state.favorites[i] = fav;
+    }
     saveJSON(STORAGE_KEYS.favorites, state.favorites);
     if (state.override && state.override.kind === 'favorite' && state.override.id === slotId) state.override = null;
     state.lookup = null;
@@ -1027,26 +1163,46 @@ function bootApp() {
     el.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
-  /** Swap `target` for an inline text field (placed beside it, never inside a button). */
-  function startRename(target, { value, placeholder, hint, onCommit }) {
+  /**
+   * Swap `target` for a small rename panel (placed beside it, never inside a button or link):
+   * a title, the field, a note (official name or address) and Save / Cancel buttons, plus
+   * an optional "Use official name" reset. Enter or tapping elsewhere saves; Escape cancels.
+   */
+  function startRename(target, { title, value, placeholder, note, resetLabel, onCommit }) {
     state.renaming = true;
+    const titleId = `rn-${Date.now().toString(36)}`;
     const input = h('input', {
       class: 'rename', type: 'text', value, placeholder, maxlength: '48',
-      enterkeyhint: 'done', 'aria-label': 'New name',
+      enterkeyhint: 'done', 'aria-labelledby': titleId,
     });
-    const block = h('span', { class: 'rename-block' }, input,
-      h('span', { class: 'rename-hint', text: hint }));
-    target.hidden = true;
-    target.parentNode.insertBefore(block, target);
     let done = false;
-    const finish = (save) => {
+    const finish = (save, v = input.value.trim()) => {
       if (done) return;
       done = true;
       state.renaming = false;
-      if (save) onCommit(input.value.trim());
+      host.classList.remove('is-renaming');
+      if (save) onCommit(v);
       render();
     };
+    // Buttons act on click but never take focus, so the field doesn't blur (and save) first.
+    const btn = (cls, text, onClick) => h('button', {
+      type: 'button', class: cls, onmousedown: (e) => e.preventDefault(), onclick: onClick,
+    }, text);
+    const block = h('div', { class: 'rename-block', role: 'group', 'aria-labelledby': titleId },
+      h('span', { class: 'rename-title', id: titleId, text: title }),
+      input,
+      note ? h('span', { class: 'rename-note', text: note }) : null,
+      h('span', { class: 'rename-actions' },
+        resetLabel ? btn('text-btn small reset', resetLabel, () => finish(true, '')) : null,
+        h('span', { class: 'spacer' }),
+        btn('btn secondary small', 'Cancel', () => finish(false)),
+        btn('btn small', 'Save', () => finish(true))));
+    const host = target.parentNode;
+    target.hidden = true;
+    host.insertBefore(block, target);
+    host.classList.add('is-renaming'); // hides the tile / mode switch beside it while the panel is open
     for (const ev of ['click', 'pointerdown', 'pointerup']) block.addEventListener(ev, (e) => e.stopPropagation());
+    block.addEventListener('pointerdown', (e) => { if (e.target.closest('button')) e.preventDefault(); });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); finish(true); }
       if (e.key === 'Escape') { e.preventDefault(); finish(false); }
@@ -1076,11 +1232,27 @@ function bootApp() {
       h('p', { class: 'hint', text: 'Drag ⠿ to reorder. Pick an address or place from the suggestions, or type one.' }));
     const list = h('div', { class: 'edit-list' });
     for (const f of state.draft) list.append(editCard(f, list));
-    wrap.append(list, h('div', { class: 'editor-foot' },
+    const add = state.draft.length < MAX_FAVORITES
+      ? h('button', { type: 'button', class: 'add-fav', onclick: () => addDraftFavorite(list) }, icon('plus'), 'Add a favorite')
+      : h('p', { class: 'hint center', text: `${MAX_FAVORITES} favorites is the most it holds. Remove one to add another.` });
+    wrap.append(list, add, h('div', { class: 'editor-foot' },
       h('button', { type: 'button', class: 'btn secondary', onclick: cancelEdit, disabled: state.saving }, 'Cancel'),
       h('button', { type: 'button', class: 'btn', onclick: () => saveEdits(list), disabled: state.saving },
         state.saving ? 'Saving…' : 'Save')));
     els.cards.replaceChildren(wrap);
+  }
+
+  /** A blank favorite at the end of the list, ready to name. */
+  function addDraftFavorite(list) {
+    syncDraftOrder(list);
+    state.draft.push({ id: newId(), label: '', address: '', lat: NaN, lon: NaN, origAddress: '', error: '', names: {}, added: true });
+    renderEditor();
+    const cards = els.cards.querySelectorAll('.edit-card');
+    const last = cards[cards.length - 1];
+    if (last) {
+      last.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      last.querySelector('.lbl').focus();
+    }
   }
 
   function editCard(f, list) {
@@ -1107,16 +1279,26 @@ function bootApp() {
     });
 
     const namesList = h('div', { class: 'edit-stations' });
-    const namesBox = h('details', { class: 'edit-names' }, h('summary', { text: 'Station names' }), namesList);
+    const namesCount = h('span', { class: 'names-count' });
+    const namesBox = h('details', {
+      class: 'edit-names', open: !!f.namesOpen,
+      ontoggle: () => { f.namesOpen = namesBox.open; },
+    }, h('summary', null, icon('pencil'), 'Rename stations', namesCount), namesList);
     const renderStationNames = () => {
       const stations = Number.isFinite(f.lat) && state.stations.length ? closestStations(f.lat, f.lon, state.stations) : [];
       namesBox.hidden = !stations.length;
+      const renamed = stations.filter((s) => (f.names[s.id] != null ? f.names[s.id].trim() : state.nicknames[s.id])).length;
+      namesCount.textContent = renamed ? `${renamed} renamed` : '';
       namesList.replaceChildren(...stations.map((s) => h('label', { class: 'st-field' },
         h('span', { class: 'st-official', text: s.name }),
         h('input', {
           type: 'text', class: 'st-name', maxlength: '48', 'aria-label': `Name for ${s.name}`,
           placeholder: 'Same as official', value: f.names[s.id] != null ? f.names[s.id] : (state.nicknames[s.id] || ''),
-          oninput: (e) => { f.names[s.id] = e.target.value; },
+          oninput: (e) => {
+            f.names[s.id] = e.target.value;
+            const n = stations.filter((x) => (f.names[x.id] != null ? f.names[x.id].trim() : state.nicknames[x.id])).length;
+            namesCount.textContent = n ? `${n} renamed` : '';
+          },
         }))));
     };
     renderStationNames();
@@ -1135,7 +1317,18 @@ function bootApp() {
               renderStationNames();
               label.focus();
             },
-          }, 'Replace')),
+          }, 'Replace'),
+          h('button', {
+            type: 'button', class: 'icon-btn remove', icon: 'trash',
+            'aria-label': `Remove ${f.label || 'this favorite'}`,
+            title: state.draft.length <= 1 ? 'Keep at least one favorite' : 'Remove',
+            disabled: state.draft.length <= 1,
+            onclick: () => {
+              syncDraftOrder(list);
+              state.draft = state.draft.filter((x) => x !== f);
+              renderEditor();
+            },
+          })),
         addrWrap, sugBox, err, namesBox));
     makeDraggable(card, list);
     return card;
@@ -1218,6 +1411,9 @@ function bootApp() {
 
   async function saveEdits(list) {
     syncDraftOrder(list);
+    // An added favorite left completely blank is just dropped (as long as something remains).
+    const blank = (f) => f.added && !f.label.trim() && !f.address.trim();
+    if (state.draft.some((f) => !blank(f))) state.draft = state.draft.filter((f) => !blank(f));
     const draft = state.draft;
     let bad = false;
     for (const f of draft) {
@@ -1245,16 +1441,18 @@ function bootApp() {
     if (bad) { renderEditor(); return; }
 
     let nick = state.nicknames;
+    const touched = new Set();
     for (const f of draft) {
       for (const [id, v] of Object.entries(f.names)) {
         const s = state.stations.find((x) => x.id === id);
         nick = setNickname(nick, id, v, s ? s.name : '');
+        touched.add(id);
       }
     }
-    state.nicknames = nick;
-    saveJSON(STORAGE_KEYS.nicknames, nick);
+    changeNicknames(nicknameChanges(state.nicknames, nick, touched));
     state.favorites = draft.map(({ id, newId: nid, label, address, lat, lon }) => ({ id: nid || id, label, address, lat, lon }));
     saveJSON(STORAGE_KEYS.favorites, state.favorites);
+    for (const f of draft) if (f.added || f.newId) state.expanded.add(f.newId || f.id); // show new places open
     // Keep a favorite-based location override pointing at the edited favorite.
     if (state.override && state.override.kind === 'favorite') {
       const f = state.favorites.find((x) => x.id === state.override.id);
@@ -1338,6 +1536,7 @@ function bootApp() {
   /* ---------------- Boot ---------------- */
   restoreStationCache();
   restoreStatusCache();
+  migrateLocalNicknames();
   render();
   requestGps();
   refresh({ withInfo: true });
@@ -1372,11 +1571,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
  * ===================================================================== */
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_RECENTS, STORAGE_KEYS, HOME_ID,
+    AUTO_RADIUS_MI, EARTH_RADIUS_MI, DEFAULT_FAVORITES, MAX_FAVORITES, MAX_RECENTS, STORAGE_KEYS, HOME_ID,
     haversineMi, closestStations, rowMode, colorClass, stationNote, deriveCounts, formatMiles, mapsUrl,
     parseStationInfo, parseStationStatus, parseVehicleTypes, feedsFromDiscovery,
     parsePhoton, parseGeoSearch, prettyStreet, categoryLabel, sortBranches,
     addRecent, setNickname, displayName, initialExpanded, cardMode,
+    cleanNicknames, loadPendingNicknames, mergeNicknames, remainingPending, nicknameRequest, nicknameChanges,
     createState, myLocation, formatUpdated, loadFavorites, loadRecents, loadNicknames, homeCoords,
   };
 }

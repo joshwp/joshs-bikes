@@ -255,4 +255,100 @@ test('mapsUrl: Google Maps search link to the exact point', () => {
   assert.equal(A.mapsUrl(40.7, -74), 'https://www.google.com/maps/search/?api=1&query=40.700000,-74.000000');
 });
 
-console.log(`\n${passed} checks passed`);
+test('name sync: merge server names with unconfirmed local changes', () => {
+  const server = { a: 'Server A', b: 'Server B' };
+  assert.deepEqual(A.mergeNicknames(server, {}), server);
+  assert.deepEqual(A.mergeNicknames(server, { a: 'Mine', b: null, c: 'New' }), { a: 'Mine', c: 'New' });
+  assert.deepEqual(server, { a: 'Server A', b: 'Server B' }); // not mutated
+});
+
+test('name sync: only confirmed changes leave the queue', () => {
+  const sent = { a: 'One', b: null };
+  // a was renamed again while the request was in flight; c is brand new
+  const now = { a: 'Two', b: null, c: 'Three' };
+  assert.deepEqual(A.remainingPending(now, sent), { a: 'Two', c: 'Three' });
+  assert.deepEqual(A.remainingPending(sent, sent), {});
+});
+
+test('name sync: request body and change detection', () => {
+  assert.deepEqual(A.nicknameRequest({ a: 'X', b: null }), { set: { a: 'X' }, clear: ['b'] });
+  const before = { a: 'X', b: 'Y' };
+  assert.deepEqual(A.nicknameChanges(before, { a: 'X2', b: 'Y' }, ['a', 'b']), { a: 'X2' });
+  assert.deepEqual(A.nicknameChanges(before, { a: 'X' }, ['b', 'z']), { b: null }); // z unchanged (absent both)
+  localStorage.setItem(A.STORAGE_KEYS.pendingNicknames, JSON.stringify({ a: 'X', b: null, c: '  ', d: 4 }));
+  assert.deepEqual(A.loadPendingNicknames(), { a: 'X', b: null, c: null });
+  localStorage.removeItem(A.STORAGE_KEYS.pendingNicknames);
+  assert.deepEqual(A.cleanNicknames({ a: ' Hi ', b: '', c: 1 }), { a: 'Hi' });
+  assert.deepEqual(A.cleanNicknames([1]), {});
+});
+
+test('favorites: more than five load; past the limit falls back to defaults', () => {
+  const place = (i) => ({ id: 'p' + i, label: 'P' + i, address: i + ' A St', lat: 40.7, lon: -74 });
+  const seven = Array.from({ length: 7 }, (_, i) => place(i));
+  localStorage.setItem(A.STORAGE_KEYS.favorites, JSON.stringify(seven));
+  assert.equal(A.loadFavorites().length, 7);
+  const tooMany = Array.from({ length: A.MAX_FAVORITES + 1 }, (_, i) => place(i));
+  localStorage.setItem(A.STORAGE_KEYS.favorites, JSON.stringify(tooMany));
+  assert.equal(A.loadFavorites().length, A.DEFAULT_FAVORITES.length);
+  localStorage.removeItem(A.STORAGE_KEYS.favorites);
+});
+
+const api = require('../api/nicknames.js');
+
+test('api: validateChanges accepts good input and normalizes it', () => {
+  assert.deepEqual(api.validateChanges({ set: { '2124037250266884686': '  Corner ' }, clear: ['abc-1'] }),
+    { set: { '2124037250266884686': 'Corner' }, clear: ['abc-1'] });
+  assert.deepEqual(api.validateChanges({ set: { a: '   ' } }), { set: {}, clear: ['a'] }); // blank = clear
+  assert.deepEqual(api.validateChanges({}), { set: {}, clear: [] });
+});
+
+test('api: validateChanges rejects bad input', () => {
+  const bad = (b) => assert.throws(() => api.validateChanges(b), api.BadRequest);
+  bad(null); bad([]); bad({ set: [] }); bad({ clear: {} });
+  bad({ set: { 'no spaces': 'x' } }); bad({ set: { a: 5 } }); bad({ set: { a: 'x'.repeat(49) } });
+  bad({ clear: [5] }); bad({ clear: ['../x'] });
+  const many = {}; for (let i = 0; i < 101; i++) many['s' + i] = 'n';
+  bad({ set: many });
+});
+
+(async () => {
+  // Handler against a fake Upstash REST endpoint.
+  const hash = new Map();
+  process.env.KV_REST_API_URL = 'https://fake-redis.test/';
+  process.env.KV_REST_API_TOKEN = 'test-token';
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    assert.equal(url, 'https://fake-redis.test/multi-exec');
+    assert.equal(opts.headers.Authorization, 'Bearer test-token');
+    const out = JSON.parse(opts.body).map(([cmd, , ...args]) => {
+      if (cmd === 'HSET') { for (let i = 0; i < args.length; i += 2) hash.set(args[i], args[i + 1]); return { result: args.length / 2 }; }
+      if (cmd === 'HDEL') { args.forEach((f) => hash.delete(f)); return { result: args.length }; }
+      if (cmd === 'HGETALL') return { result: [...hash].flat() };
+      return { error: 'unknown' };
+    });
+    return { ok: true, status: 200, json: async () => out };
+  };
+  const call = async (method, body) => {
+    const res = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, end(s) { this.body = JSON.parse(s); } };
+    await api({ method, body }, res);
+    return res;
+  };
+  let r = await call('POST', { set: { s1: 'Home corner', s2: 'Gym' } });
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner', s2: 'Gym' } });
+  r = await call('POST', JSON.stringify({ clear: ['s2'] })); // string bodies work too
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' } });
+  r = await call('GET');
+  assert.deepEqual(r.body, { nicknames: { s1: 'Home corner' } });
+  assert.equal(r.headers['Cache-Control'], 'no-store');
+  assert.equal((await call('POST', { set: { s1: 7 } })).statusCode, 400);
+  assert.equal((await call('POST', '{oops')).statusCode, 400);
+  assert.equal((await call('DELETE')).statusCode, 405);
+  delete process.env.KV_REST_API_URL;
+  const errLog = console.error; console.error = () => {};
+  assert.equal((await call('GET')).statusCode, 500); // not configured
+  console.error = errLog;
+  globalThis.fetch = realFetch;
+  passed++; console.log('ok - api: handler round trip against a fake Redis');
+  console.log(`\n${passed} checks passed`);
+})().catch((e) => { console.error(e); process.exit(1); });
